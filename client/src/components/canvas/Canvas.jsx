@@ -76,11 +76,28 @@ export default function Canvas({ color = '#000000', brushSize = 5, roomId = 'tes
     setIsDrawing(false);
   };
 
+  const handleMouseMove = ({ nativeEvent }) => {
+    const { offsetX, offsetY } = nativeEvent;
+    
+    // Emit cursor position constantly
+    socket.emit('cursor-move', { roomId, x: offsetX, y: offsetY });
+
+    // Only draw if mouse is clicked
+    if (!isDrawing) return;
+    
+    const ctx = canvasRef.current.getContext('2d');
+    ctx.lineTo(offsetX, offsetY);
+    ctx.stroke();
+    
+    emitDrawEvent(offsetX, offsetY, false);
+  };
+
+  // Update the return statement at the bottom
   return (
     <canvas
       ref={canvasRef}
       onMouseDown={startDrawing}
-      onMouseMove={draw}
+      onMouseMove={handleMouseMove} // Changed this line
       onMouseUp={stopDrawing}
       onMouseLeave={stopDrawing}
       className="bg-white cursor-crosshair touch-none"

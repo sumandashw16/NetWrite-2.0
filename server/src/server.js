@@ -3,6 +3,7 @@ import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import registerDrawHandlers from './socket/drawHandler.js';
+import registerCursorHandlers from './socket/cursorHandler.js';
 
 const app = express();
 app.use(cors());
@@ -22,14 +23,15 @@ io.on('connection', (socket) => {
 
   socket.on('join-room', (roomId) => {
     socket.join(roomId);
-    console.log(`Socket ${socket.id} joined room ${roomId}`);
   });
 
-  // Register drawing events
   registerDrawHandlers(io, socket);
+  registerCursorHandlers(io, socket);
 
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
+    // Tell everyone to remove this user's cursor
+    socket.broadcast.emit('user-disconnected', socket.id);
   });
 });
 

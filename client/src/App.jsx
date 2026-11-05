@@ -1,12 +1,13 @@
 import { useState } from 'react';
 import Canvas from './components/canvas/Canvas';
+import LiveCursors from './components/collaboration/LiveCursors';
 
 function App() {
   const [color, setColor] = useState('#000000');
   const [brushSize, setBrushSize] = useState(5);
 
   return (
-    <div className="w-screen h-screen overflow-hidden">
+    <div className="relative w-screen h-screen overflow-hidden">
       {/* Temporary basic toolbar for testing */}
       <div className="absolute top-4 left-4 z-10 bg-white p-4 rounded shadow flex gap-4">
         <input 
@@ -28,6 +29,7 @@ function App() {
       </div>
 
       <Canvas color={color} brushSize={brushSize} />
+      <LiveCursors />
     </div>
   );
 }
