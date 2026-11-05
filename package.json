@@ -1,0 +1,15 @@
+{
+  "name": "netwrite",
+  "version": "1.0.0",
+  "description": "NetWrite - Real-Time Collaborative Online Whiteboard",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install --prefix server && npm install --prefix client",
+    "server": "npm run dev --prefix server",
+    "client": "npm run dev --prefix client",
+    "dev": "node -e \"const { spawn } = require('child_process'); const s = spawn('npm', ['run', 'dev', '--prefix', 'server'], { stdio: 'inherit', shell: true }); const c = spawn('npm', ['run', 'dev', '--prefix', 'client'], { stdio: 'inherit', shell: true }); process.on('SIGINT', () => { s.kill(); c.kill(); process.exit(); });\""
+  },
+  "dependencies": {
+    "socket.io-client": "^4.8.4"
+  }
+}
