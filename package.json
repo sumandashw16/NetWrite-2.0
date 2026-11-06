@@ -10,6 +10,12 @@
     "dev": "node -e \"const { spawn } = require('child_process'); const s = spawn('npm', ['run', 'dev', '--prefix', 'server'], { stdio: 'inherit', shell: true }); const c = spawn('npm', ['run', 'dev', '--prefix', 'client'], { stdio: 'inherit', shell: true }); process.on('SIGINT', () => { s.kill(); c.kill(); process.exit(); });\""
   },
   "dependencies": {
-    "socket.io-client": "^4.8.4"
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^18.0.9",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.12.0",
+    "react-router-dom": "^7.18.5",
+    "socket.io-client": "^4.8.4",
+    "uuid": "^14.0.3"
   }
 }
