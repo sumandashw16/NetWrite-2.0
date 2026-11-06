@@ -1,15 +1,32 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import Home from './pages/Home';
 import Board from './pages/Board';
-import Auth from './pages/Auth'; // New import
+import Auth from './pages/Auth';
+import ProtectedRoute from './components/auth/ProtectedRoute';
 
 function App() {
   return (
     <BrowserRouter>
       <Routes>
         <Route path="/auth" element={<Auth />} />
-        <Route path="/" element={<Home />} />
-        <Route path="/board/:roomId" element={<Board />} />
+        
+        {/* Protected Routes */}
+        <Route 
+          path="/" 
+          element={
+            <ProtectedRoute>
+              <Home />
+            </ProtectedRoute>
+          } 
+        />
+        <Route 
+          path="/board/:roomId" 
+          element={
+            <ProtectedRoute>
+              <Board />
+            </ProtectedRoute>
+          } 
+        />
       </Routes>
     </BrowserRouter>
   );

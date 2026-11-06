@@ -8,7 +8,11 @@ export default function LiveCursors() {
     socket.on('receive-cursor', (data) => {
       setCursors((prev) => ({
         ...prev,
-        [data.socketId]: { x: data.x, y: data.y }
+        [data.socketId]: { 
+          x: data.x, 
+          y: data.y, 
+          username: data.username // Save the username
+        }
       }));
     });
 
@@ -28,25 +32,28 @@ export default function LiveCursors() {
 
   return (
     <>
-      {Object.entries(cursors).map(([socketId, pos]) => (
+      {Object.entries(cursors).map(([socketId, data]) => (
         <div
           key={socketId}
-          className="absolute pointer-events-none z-50 flex items-center gap-1"
           style={{ 
             position: 'absolute',
-            pointerEvents: 'none',
-            zIndex: 50,
             left: 0, 
             top: 0, 
-            transform: `translate(${pos.x}px, ${pos.y}px)`,
-            transition: 'transform 0.05s linear' // Smooth out the movement
+            transform: `translate(${data.x}px, ${data.y}px)`,
+            transition: 'transform 0.05s linear',
+            pointerEvents: 'none',
+            zIndex: 50,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '4px'
           }}
         >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="#ef4444" xmlns="http://www.w3.org/2000/svg">
             <path d="M4 2L20 12L11.5 13.5L8 22L4 2Z" stroke="white" strokeWidth="2" strokeLinejoin="round"/>
           </svg>
-          <span className="bg-red-500 text-white text-[10px] px-2 py-0.5 rounded-full shadow-md">
-            Guest
+          {/* Display the actual username here */}
+          <span style={{ background: '#ef4444', color: 'white', fontSize: '10px', padding: '2px 8px', borderRadius: '12px', boxShadow: '0 2px 4px rgba(0,0,0,0.2)' }}>
+            {data.username}
           </span>
         </div>
       ))}

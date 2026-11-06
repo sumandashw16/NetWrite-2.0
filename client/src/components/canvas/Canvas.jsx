@@ -1,10 +1,12 @@
-import { useRef, useState, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { useRef, useState, useEffect, forwardRef, useImperativeHandle, useContext } from 'react';
 import { socket } from '../../services/socket';
+import { AuthContext } from '../../context/AuthContext';
 
 const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) => {
   const canvasRef = useRef(null);
   const [isDrawing, setIsDrawing] = useState(false);
-  
+  const { user } = useContext(AuthContext);
+
   // Track all strokes in memory without causing React to re-render
   const strokeHistory = useRef([]);
 
@@ -92,7 +94,12 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) =>
 
   const handleMouseMove = ({ nativeEvent }) => {
     const { offsetX, offsetY } = nativeEvent;
-    socket.emit('cursor-move', { roomId, x: offsetX, y: offsetY });
+    socket.emit('cursor-move', { 
+      roomId, 
+      x: offsetX, 
+      y: offsetY,
+      username: user?.username || 'Unknown'
+    });
 
     if (!isDrawing) return;
     

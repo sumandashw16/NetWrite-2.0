@@ -4,7 +4,8 @@ export default function registerCursorHandlers(io, socket) {
     socket.to(cursorData.roomId).emit('receive-cursor', {
       socketId: socket.id,
       x: cursorData.x,
-      y: cursorData.y
+      y: cursorData.y,
+      username: cursorData.username
     });
   });
 }

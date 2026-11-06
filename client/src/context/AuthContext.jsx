@@ -3,16 +3,11 @@ import { createContext, useState, useEffect } from 'react';
 export const AuthContext = createContext();
 
 export const AuthProvider = ({ children }) => {
-  const [user, setUser] = useState(null);
-
-  useEffect(() => {
-    // Check if user is already logged in on page load
+  const [user, setUser] = useState(() => {
     const token = localStorage.getItem('token');
     const username = localStorage.getItem('username');
-    if (token && username) {
-      setUser({ token, username });
-    }
-  }, []);
+    return token && username ? { token, username } : null;
+  });
 
   const login = (token, username) => {
     localStorage.setItem('token', token);
