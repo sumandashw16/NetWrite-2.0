@@ -9,6 +9,7 @@ import registerDrawHandlers from './socket/drawHandler.js';
 import registerCursorHandlers from './socket/cursorHandler.js';
 import boardRoutes from './routes/boardRoutes.js';
 import authRoutes from './routes/authRoutes.js';
+import { loadRoom } from './socket/roomStore.js';
 
 // Resolve MongoDB Atlas SRV record lookup timeout on local/ISP DNS
 dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -50,11 +51,20 @@ const io = new Server(server, {
 });
 
 io.on('connection', (socket) => {
-  socket.on('join-room', (roomId) => {
+  socket.on('join-room', async (roomId) => {
+    socket.data.roomId = roomId;
     socket.join(roomId);
+    try {
+      const strokes = await loadRoom(roomId);
+      socket.emit('canvas-catch-up', strokes); // only to this user
+    } catch (err) {
+      console.error(`Failed to load room ${roomId}:`, err);
+    }
   });
+
   registerDrawHandlers(io, socket);
   registerCursorHandlers(io, socket);
+
   socket.on('disconnect', () => {
     socket.broadcast.emit('user-disconnected', socket.id);
   });

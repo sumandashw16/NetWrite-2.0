@@ -137,11 +137,10 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) =>
   useImperativeHandle(ref, () => ({
     saveToDatabase: async () => {
       try {
-        await fetch(`http://localhost:5000/api/boards/${roomId}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ strokes: Array.from(strokesRef.current.values()) })
+        const res = await fetch(`http://localhost:5000/api/boards/${roomId}`, {
+          method: 'POST'
         });
+        if (!res.ok) throw new Error(`Server responded ${res.status}`);
         alert('Board saved successfully!');
       } catch (error) {
         console.error('Error saving board:', error);
