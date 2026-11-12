@@ -9,7 +9,7 @@ import registerDrawHandlers from './socket/drawHandler.js';
 import registerCursorHandlers from './socket/cursorHandler.js';
 import boardRoutes from './routes/boardRoutes.js';
 import authRoutes from './routes/authRoutes.js';
-import { loadRoom } from './socket/roomStore.js';
+import { loadRoom, activeRoomsData } from './socket/roomStore.js';
 
 // Resolve MongoDB Atlas SRV record lookup timeout on local/ISP DNS
 dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -44,6 +44,17 @@ if (!mongoURI) {
 // API Routes
 app.use('/api/boards', boardRoutes);
 app.use('/api/auth', authRoutes);
+
+if (process.env.NODE_ENV !== 'production') {
+  app.get('/debug/rooms', (req, res) => {
+    res.json({
+      roomsInRam: [...activeRoomsData].map(([roomId, strokes]) => ({
+        roomId,
+        strokes: strokes.length
+      }))
+    });
+  });
+}
 
 const server = http.createServer(app);
 const io = new Server(server, {

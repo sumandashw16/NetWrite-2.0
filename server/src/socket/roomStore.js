@@ -20,6 +20,7 @@ export function loadRoom(roomId) {
           (s) => s && typeof s.id === 'string' && Array.isArray(s.points)
         );
         activeRoomsData.set(roomId, strokes);
+        console.log(`[rooms] loaded ${roomId} (${strokes.length} strokes). In RAM: ${activeRoomsData.size}`);
         return strokes;
       })
       .finally(() => loadingRooms.delete(roomId));

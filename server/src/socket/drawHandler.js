@@ -62,6 +62,7 @@ export default function registerDrawHandlers(io, socket) {
             // Don't evict if someone rejoined while we were saving
             if ((io.sockets.adapter.rooms.get(roomId)?.size ?? 0) === 0) {
               activeRoomsData.delete(roomId);
+              console.log(`[rooms] evicted ${roomId}. In RAM: ${activeRoomsData.size}`);
             }
           })
           .catch((err) => console.error(`Flush failed for ${roomId}, keeping in RAM:`, err));
