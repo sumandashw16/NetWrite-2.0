@@ -10,11 +10,18 @@ const strokeSchema = new mongoose.Schema(
     color: String,
     width: Number,
     points: {
-      type: [Number], // flat array: [x0, y0, x1, y1, ...]
+      type: [Number], // flat array: [x0, y0, x1, y1, ...]. Never mutated after stroke:end.
       default: []
-    }
+    },
+
+    // Non-destructive transform. Applied at render time around the center of the raw-points AABB.
+    x: { type: Number, default: 0 },        // translation, world units
+    y: { type: Number, default: 0 },
+    scaleX: { type: Number, default: 1 },
+    scaleY: { type: Number, default: 1 },
+    rotation: { type: Number, default: 0 }  // radians
   },
-  { _id: false } // we already have our own id; skip Mongo's per-stroke ObjectId
+  { _id: false }
 );
 
 const boardSchema = new mongoose.Schema(

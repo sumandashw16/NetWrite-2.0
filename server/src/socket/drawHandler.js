@@ -1,6 +1,10 @@
 import { activeRoomsData, loadRoom, flushRoom, markDirty } from './roomStore.js';
 
-const MAX_POINTS = 50_000; // sanity cap on a single stroke
+const MAX_POINTS = 50_000;          // sanity cap on a single stroke
+const MAX_UPDATES_PER_EVENT = 500;  // cap on objects moved in one stroke:update
+const COORD_LIMIT = 1_000_000;      // sanity cap on x/y offsets
+const MIN_ABS_SCALE = 0.01;
+const MAX_ABS_SCALE = 100;
 
 const isValidStroke = (s) =>
   s &&
@@ -9,6 +13,36 @@ const isValidStroke = (s) =>
   s.points.length % 2 === 0 &&
   s.points.length <= MAX_POINTS * 2 &&
   s.points.every(Number.isFinite);
+
+const clampCoord = (v) => Math.max(-COORD_LIMIT, Math.min(COORD_LIMIT, v));
+const validScale = (v) =>
+  Number.isFinite(v) && Math.abs(v) >= MIN_ABS_SCALE && Math.abs(v) <= MAX_ABS_SCALE;
+
+// For stroke:end (including redo of a moved stroke): keep valid transform fields, default the rest
+function sanitizeTransform(s) {
+  return {
+    x: Number.isFinite(s.x) ? clampCoord(s.x) : 0,
+    y: Number.isFinite(s.y) ? clampCoord(s.y) : 0,
+    scaleX: validScale(s.scaleX) ? s.scaleX : 1,
+    scaleY: validScale(s.scaleY) ? s.scaleY : 1,
+    rotation: Number.isFinite(s.rotation) ? s.rotation : 0
+  };
+}
+
+// For stroke:update: apply only the fields that are present AND valid.
+// Returns the sanitized partial update, or null if nothing was applied.
+function applyUpdate(target, u) {
+  const out = { id: target.id };
+  let changed = false;
+
+  if (Number.isFinite(u.x)) { target.x = clampCoord(u.x); out.x = target.x; changed = true; }
+  if (Number.isFinite(u.y)) { target.y = clampCoord(u.y); out.y = target.y; changed = true; }
+  if (validScale(u.scaleX)) { target.scaleX = u.scaleX; out.scaleX = u.scaleX; changed = true; }
+  if (validScale(u.scaleY)) { target.scaleY = u.scaleY; out.scaleY = u.scaleY; changed = true; }
+  if (Number.isFinite(u.rotation)) { target.rotation = u.rotation; out.rotation = u.rotation; changed = true; }
+
+  return changed ? out : null;
+}
 
 export default function registerDrawHandlers(io, socket) {
   // Live preview: pure relay. Never stored in RAM or the database.
@@ -27,13 +61,52 @@ export default function registerDrawHandlers(io, socket) {
     try {
       const strokes = activeRoomsData.get(roomId) ?? (await loadRoom(roomId));
       if (strokes.some((s) => s.id === stroke.id)) return; // ignore duplicates
-      strokes.push(stroke);
-      (socket.data.ownIds ??= new Set()).add(stroke.id);   // remember who drew it
+
+      const clean = { ...stroke, ...sanitizeTransform(stroke) };
+      strokes.push(clean);
+      (socket.data.ownIds ??= new Set()).add(clean.id);    // remember who drew it
       markDirty(roomId);
-      socket.to(roomId).emit('stroke:end', stroke);
+      socket.to(roomId).emit('stroke:end', clean);
     } catch (err) {
       console.error(`stroke:end failed for room ${roomId}:`, err);
     }
+  });
+
+  // Move (and later scale/rotate) existing strokes.
+  // payload: { updates: [{ id, x, y, scaleX?, scaleY?, rotation? }], final: boolean }
+  // Absolute values, so last-write-wins and a dropped packet is harmless.
+  socket.on('stroke:update', (payload) => {
+    const roomId = socket.data.roomId;
+    if (!roomId) return;
+
+    const raw = payload?.updates;
+    if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_UPDATES_PER_EVENT) return;
+
+    const strokes = activeRoomsData.get(roomId);
+    if (!strokes) return;
+
+    // id -> requested update (later duplicates win)
+    const wanted = new Map();
+    for (const u of raw) {
+      if (u && typeof u.id === 'string') wanted.set(u.id, u);
+    }
+    if (wanted.size === 0) return;
+
+    // One pass over the room instead of a findIndex per update
+    const applied = [];
+    for (const stroke of strokes) {
+      const u = wanted.get(stroke.id);
+      if (!u) continue;
+      const out = applyUpdate(stroke, u);
+      if (out) applied.push(out);
+      if (applied.length === wanted.size) break;
+    }
+    if (applied.length === 0) return;
+
+    const final = payload.final === true;
+    markDirty(roomId); // only flag for persistence when the drag ends
+
+    socket.to(roomId).emit('stroke:update', { updates: applied, final });
   });
 
   socket.on('stroke:remove', (payload) => {
