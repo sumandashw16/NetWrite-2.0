@@ -12,9 +12,14 @@ const HIT_TOLERANCE_PX = 4;       // extra click slop around a stroke (screen px
 const DRAG_THRESHOLD_PX = 3;      // pointer must move this far before a click becomes a drag
 const SELECTION_COLOR = '#2563eb';
 const ERASER_RADIUS_PX = 8;       // eraser reach around the pointer (screen px)
+const OUTLINE_PAD_PX = 3;         // gap between the ink edge and the dashed outline (screen px)
+const SELECTION_DASH_PX = [6, 4]; // dash, gap (screen px)
+const MARCH_SPEED_PX = 20; // how fast the ants crawl (screen px per second)
 
 const round1 = (n) => Math.round(n * 10) / 10;
-
+const prefersReducedMotion = () =>
+  typeof window !== 'undefined' &&
+  window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 // ---------------------------------------------------------------------------
 // Geometry simplification
 // ---------------------------------------------------------------------------
@@ -237,6 +242,88 @@ function strokesInRect(strokesMap, x0, y0, x1, y1) {
   return hits;
 }
 
+// Closed outline polygon hugging the stroke's ink, returned in WORLD space.
+// Offsets the polyline by (width/2 + pad) on both sides and joins them with round caps.
+function getStrokeOutlineWorld(stroke, padPx, cameraScale) {
+  const b = getLocalBounds(stroke);
+  if (!b) return null;
+
+  const t = getTransform(stroke);
+  const objScale = (Math.abs(t.scaleX) + Math.abs(t.scaleY)) / 2 || 1;
+  const r = (stroke.width ?? 1) / 2 + padPx / (cameraScale * objScale); // local-space radius
+
+  // Drop duplicate points (rounding to 1 decimal can create them)
+  const src = stroke.points;
+  const pts = [];
+  for (let i = 0; i < src.length; i += 2) {
+    const last = pts[pts.length - 1];
+    if (!last || Math.hypot(src[i] - last[0], src[i + 1] - last[1]) > 1e-6) {
+      pts.push([src[i], src[i + 1]]);
+    }
+  }
+
+  const local = [];
+  const CAP_STEPS = 10;
+  const arc = (cx, cy, a0, a1, steps) => {
+    for (let i = 0; i <= steps; i++) {
+      const a = a0 + ((a1 - a0) * i) / steps;
+      local.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
+    }
+  };
+
+  if (pts.length === 1) {
+    arc(pts[0][0], pts[0][1], 0, Math.PI * 2, 24);
+  } else {
+    // Unit normals per segment
+    const normals = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const dx = pts[i + 1][0] - pts[i][0];
+      const dy = pts[i + 1][1] - pts[i][1];
+      const len = Math.hypot(dx, dy);
+      normals.push([-dy / len, dx / len]);
+    }
+
+    // Per-vertex normal (averaged, miter length clamped) -> left and right offset points
+    const left = [], right = [];
+    for (let i = 0; i < pts.length; i++) {
+      let nx, ny, scale = 1;
+      if (i === 0) [nx, ny] = normals[0];
+      else if (i === pts.length - 1) [nx, ny] = normals[normals.length - 1];
+      else {
+        const [ax, ay] = normals[i - 1];
+        const [bx, by] = normals[i];
+        nx = ax + bx; ny = ay + by;
+        const len = Math.hypot(nx, ny) || 1;
+        nx /= len; ny /= len;
+        const d = nx * bx + ny * by;
+        scale = Math.min(2, 1 / Math.max(d, 0.5)); // clamp so sharp corners don't spike
+      }
+      left.push([pts[i][0] + nx * r * scale, pts[i][1] + ny * r * scale]);
+      right.push([pts[i][0] - nx * r * scale, pts[i][1] - ny * r * scale]);
+    }
+
+    const last = pts.length - 1;
+    const endA = Math.atan2(normals[normals.length - 1][1], normals[normals.length - 1][0]);
+    const startA = Math.atan2(normals[0][1], normals[0][0]);
+
+    for (const p of left) local.push(p);                                  // left side, forward
+    arc(pts[last][0], pts[last][1], endA, endA - Math.PI, CAP_STEPS);     // end cap
+    for (let i = right.length - 1; i >= 0; i--) local.push(right[i]);     // right side, backward
+    arc(pts[0][0], pts[0][1], startA + Math.PI, startA, CAP_STEPS);       // start cap
+  }
+
+  // Local -> world (same math as getWorldCorners)
+  const cx = (b.minX + b.maxX) / 2;
+  const cy = (b.minY + b.maxY) / 2;
+  const cos = Math.cos(t.rotation);
+  const sin = Math.sin(t.rotation);
+  return local.map(([lx, ly]) => {
+    const sx = (lx - cx) * t.scaleX;
+    const sy = (ly - cy) * t.scaleY;
+    return [cx + t.x + sx * cos - sy * sin, cy + t.y + sx * sin + sy * cos];
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -358,21 +445,26 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     for (const preview of peerPreviewsRef.current.values()) drawStroke(ctx, preview);
     if (currentStrokeRef.current) drawStroke(ctx, currentStrokeRef.current);
 
-    // Selection boxes: the oriented bounding box, so they stay correct once rotation exists
+    // Selection outlines: animated dashed border hugging each selected stroke's ink
     const selected = selectedIdsRef.current;
     if (selected.size) {
+      const period = SELECTION_DASH_PX[0] + SELECTION_DASH_PX[1];
+      const phase = ((performance.now() / 1000) * MARCH_SPEED_PX) % period; // wrap to avoid huge numbers
+
       ctx.save();
       ctx.strokeStyle = SELECTION_COLOR;
-      ctx.lineWidth = 1 / scale;               // 1 screen px regardless of zoom
-      ctx.setLineDash([]);
+      ctx.lineWidth = 1 / scale;
+      ctx.setLineDash(SELECTION_DASH_PX.map((d) => d / scale));
+      ctx.lineDashOffset = -phase / scale;      // negative = dashes travel forward along the path
+      ctx.lineJoin = 'round';
       for (const id of selected) {
         const stroke = strokesRef.current.get(id);
         if (!stroke) continue;
-        const corners = getWorldCorners(stroke, (stroke.width ?? 1) / 2);
-        if (!corners) continue;
+        const outline = getStrokeOutlineWorld(stroke, OUTLINE_PAD_PX, scale);
+        if (!outline || outline.length < 3) continue;
         ctx.beginPath();
-        ctx.moveTo(corners[0][0], corners[0][1]);
-        for (let i = 1; i < 4; i++) ctx.lineTo(corners[i][0], corners[i][1]);
+        ctx.moveTo(outline[0][0], outline[0][1]);
+        for (let i = 1; i < outline.length; i++) ctx.lineTo(outline[i][0], outline[i][1]);
         ctx.closePath();
         ctx.stroke();
       }
@@ -394,6 +486,9 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       ctx.strokeRect(rx, ry, rw, rh);
       ctx.restore();
     }
+    // Marching ants: keep requesting frames only while something is selected.
+    // When the selection empties, the loop stops by itself.
+    if (selectedIdsRef.current.size && !prefersReducedMotion()) scheduleRedraw();
   };
 
   // Coalesce multiple redraw requests into one per animation frame
