@@ -5,6 +5,8 @@ import { AuthContext } from '../../context/AuthContext';
 const MIN_POINT_DISTANCE = 1;     // 1px radial prefilter
 const PREVIEW_INTERVAL_MS = 40;   // throttle for stroke:preview
 const SIMPLIFY_EPSILON = 1.0;     // Douglas-Peucker tolerance (px)
+const MIN_SCALE = 0.1;
+const MAX_SCALE = 10;
 
 const round1 = (n) => Math.round(n * 10) / 10;
 
@@ -100,10 +102,14 @@ function drawStroke(ctx, stroke) {
   ctx.stroke();
 }
 
-const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) => {
+const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraChange}, ref) => {
   const canvasRef = useRef(null);
   const { user } = useContext(AuthContext);
-
+  const cameraRef = useRef({ x: 0, y: 0, scale: 1 }); // local to each user, never sent over the socket
+  const panRef = useRef(null);                        // last pointer position while panning
+  const spaceRef = useRef(false);                     // is Space held?
+  const onCameraChangeRef = useRef(onCameraChange);
+  onCameraChangeRef.current = onCameraChange;
   // Refs, not state: drawing is imperative, and we don't want a React re-render per point.
   const strokesRef = useRef(new Map());        // finalized strokes: id -> stroke
   const currentStrokeRef = useRef(null);       // my in-progress stroke
@@ -115,12 +121,16 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) =>
 
   const userId = user?._id || user?.id || user?.username || 'anonymous';
 
-  // Clear, draw finalized strokes, then peer previews, then my current stroke on top
   const redrawAll = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);            // identity, so clearRect covers the whole screen
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const { x, y, scale } = cameraRef.current;
+    ctx.setTransform(scale, 0, 0, scale, x, y);    // everything below is drawn in world space
 
     for (const stroke of strokesRef.current.values()) drawStroke(ctx, stroke);
     for (const preview of peerPreviewsRef.current.values()) drawStroke(ctx, preview);
@@ -134,6 +144,17 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) =>
       rafRef.current = null;
       redrawAll();
     });
+  };
+
+  // world = (screen - camera) / scale
+  const screenToWorld = (sx, sy) => {
+    const c = cameraRef.current;
+    return [(sx - c.x) / c.scale, (sy - c.y) / c.scale];
+  };
+
+  const cameraChanged = () => {
+    scheduleRedraw();
+    onCameraChangeRef.current?.({ ...cameraRef.current }); // LiveCursors needs it to place cursors
   };
 
   const undo = () => {
@@ -172,6 +193,10 @@ useEffect(() => {
   useImperativeHandle(ref, () => ({
     undo,
     redo,
+    resetView: () => {
+      Object.assign(cameraRef.current, { x: 0, y: 0, scale: 1 });
+      cameraChanged();
+    },
     saveToDatabase: async () => {
       try {
         const res = await fetch(`http://localhost:5000/api/boards/${roomId}`, {
@@ -239,6 +264,39 @@ useEffect(() => {
       scheduleRedraw();
     };
 
+    const onWheel = (e) => {
+      e.preventDefault(); // only works with { passive: false } below
+      const cam = cameraRef.current;
+      const rect = canvas.getBoundingClientRect();
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+
+      const [wx, wy] = screenToWorld(sx, sy);                 // world point under the cursor
+      const k = e.ctrlKey ? 0.01 : 0.001;                      // trackpad pinch vs mouse wheel
+      const next = Math.min(MAX_SCALE, Math.max(MIN_SCALE, cam.scale * Math.exp(-e.deltaY * k)));
+
+      cam.scale = next;
+      cam.x = sx - wx * next;                                  // keep that world point under the cursor
+      cam.y = sy - wy * next;
+      cameraChanged();
+    };
+    const onKeyDown = (e) => {
+      if (e.code !== 'Space') return;
+      e.preventDefault();
+      if (spaceRef.current) return;
+      spaceRef.current = true;
+      if (!panRef.current) canvas.style.cursor = 'grab';
+    };
+    const onKeyUp = (e) => {
+      if (e.code !== 'Space') return;
+      spaceRef.current = false;
+      if (!panRef.current) canvas.style.cursor = '';
+    };
+    const onBlur = () => { spaceRef.current = false; canvas.style.cursor = ''; };
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
     // Register listeners BEFORE joining so the catch-up can't be missed
     socket.on('canvas-catch-up', handleCatchUp);
     socket.on('stroke:preview', handlePreview);
@@ -257,50 +315,67 @@ useEffect(() => {
       socket.off('clear-board', handleClear);
       socket.off('peer-left', handlePeerLeft);
       socket.off('stroke:remove', handleRemove);
+      canvas.removeEventListener('wheel', onWheel);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
   }, [roomId]);
 
   const handlePointerDown = (e) => {
-    if (e.button !== 0) return;
-    // Keep receiving move/up events even if the pointer leaves the canvas
     e.currentTarget.setPointerCapture(e.pointerId);
 
+    if (e.button === 2 || spaceRef.current) {         // right-click OR space → pan
+      panRef.current = { x: e.clientX, y: e.clientY };
+      canvasRef.current.style.cursor = 'grabbing';
+      return;
+    }
+
+    if (e.button !== 0) return;                       // ignore middle-click etc.
+
     const { offsetX, offsetY } = e.nativeEvent;
+    const [wx, wy] = screenToWorld(offsetX, offsetY);   // store WORLD coordinates
     currentStrokeRef.current = {
       id: crypto.randomUUID(),
       userId,
       color,
       width: brushSize,
-      points: [offsetX, offsetY]
+      points: [wx, wy]
     };
     lastPreviewEmitRef.current = 0;
     scheduleRedraw();
   };
 
   const handlePointerMove = (e) => {
-    const { offsetX: x, offsetY: y } = e.nativeEvent;
+    const { offsetX, offsetY } = e.nativeEvent;
+    const [x, y] = screenToWorld(offsetX, offsetY);
 
-    socket.emit('cursor-move', {
-      roomId,
-      x,
-      y,
-      username: user?.username || 'Unknown'
-    });
+    // Cursor is sent in world coordinates; each viewer converts with their own camera
+    socket.emit('cursor-move', { roomId, x, y, username: user?.username || 'Unknown' });
+
+    if (panRef.current) {                          // panning: move the camera by the screen delta
+      const cam = cameraRef.current;
+      cam.x += e.clientX - panRef.current.x;
+      cam.y += e.clientY - panRef.current.y;
+      panRef.current = { x: e.clientX, y: e.clientY };
+      cameraChanged();
+      return;
+    }
 
     const stroke = currentStrokeRef.current;
     if (!stroke) return;
 
-    // 1px radial prefilter: drop points too close to the last kept one
+    // 1px on SCREEN = 1/scale in world units
+    const minD = MIN_POINT_DISTANCE / cameraRef.current.scale;
     const pts = stroke.points;
     const dx = x - pts[pts.length - 2];
     const dy = y - pts[pts.length - 1];
-    if (dx * dx + dy * dy < MIN_POINT_DISTANCE * MIN_POINT_DISTANCE) return;
+    if (dx * dx + dy * dy < minD * minD) return;
 
     pts.push(x, y);
 
-    // Throttled live preview: send the whole stroke so far so peers can smooth it
     const now = performance.now();
     if (now - lastPreviewEmitRef.current >= PREVIEW_INTERVAL_MS) {
       lastPreviewEmitRef.current = now;
@@ -318,6 +393,11 @@ useEffect(() => {
   };
 
   const handlePointerUp = () => {
+    if (panRef.current) {
+      panRef.current = null;
+      canvasRef.current.style.cursor = spaceRef.current ? 'grab' : '';
+      return;
+    }
     const stroke = currentStrokeRef.current;
     if (!stroke) return;
     currentStrokeRef.current = null;
@@ -325,7 +405,8 @@ useEffect(() => {
     // Douglas-Peucker, then round to 1 decimal place
     const finalStroke = {
       ...stroke,
-      points: simplify(stroke.points, SIMPLIFY_EPSILON).map(round1)
+      points: simplify(stroke.points, SIMPLIFY_EPSILON / cameraRef.current.scale).map(round1)
+
     };
 
     strokesRef.current.set(finalStroke.id, finalStroke);
@@ -342,6 +423,7 @@ useEffect(() => {
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
+      onContextMenu={(e) => e.preventDefault()}
       className="bg-white cursor-crosshair touch-none"
     />
   );

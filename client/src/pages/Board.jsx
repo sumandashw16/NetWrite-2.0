@@ -7,6 +7,7 @@ export default function Board() {
   const { roomId } = useParams();
   const [color, setColor] = useState('#000000');
   const [brushSize, setBrushSize] = useState(5);
+  const [camera, setCamera] = useState({ x: 0, y: 0, scale: 1 });
   
   // Create a ref to access functions inside the Canvas component
   const canvasRef = useRef(); 
@@ -39,6 +40,7 @@ export default function Board() {
         </button>
         <button onClick={() => canvasRef.current?.undo()} style={{ padding: '4px 8px', cursor: 'pointer' }}>Undo</button> 
         <button onClick={() => canvasRef.current?.redo()} style={{ padding: '4px 8px', cursor: 'pointer' }}>Redo</button>
+        <button onClick={() => canvasRef.current?.resetView()} style={{ padding: '4px 8px', cursor: 'pointer' }}>Reset view</button>
         {/* New Save Button */}
         <button 
           onClick={handleSave} 
@@ -49,8 +51,8 @@ export default function Board() {
       </div>
 
       {/* Pass the ref to the Canvas */}
-      <Canvas ref={canvasRef} color={color} brushSize={brushSize} roomId={roomId} />
-      <LiveCursors />
+      <Canvas ref={canvasRef} color={color} brushSize={brushSize} roomId={roomId} onCameraChange={setCamera} />
+      <LiveCursors camera={camera} />
     </div>
   );
 }

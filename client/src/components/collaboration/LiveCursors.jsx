@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { socket } from '../../services/socket';
 
-export default function LiveCursors() {
+export default function LiveCursors({ camera = { x: 0, y: 0, scale: 1 } }) {
   const [cursors, setCursors] = useState({});
 
   useEffect(() => {
@@ -39,7 +39,7 @@ export default function LiveCursors() {
             position: 'absolute',
             left: 0, 
             top: 0, 
-            transform: `translate(${data.x}px, ${data.y}px)`,
+            transform: `translate(${data.x * camera.scale + camera.x}px, ${data.y * camera.scale + camera.y}px)`,
             transition: 'transform 0.05s linear',
             pointerEvents: 'none',
             zIndex: 50,
