@@ -37,7 +37,8 @@ export default function Board() {
         <button onClick={() => setColor('#ffffff')} style={{ padding: '4px 8px', cursor: 'pointer' }}>
           Eraser
         </button>
-        
+        <button onClick={() => canvasRef.current?.undo()} style={{ padding: '4px 8px', cursor: 'pointer' }}>Undo</button> 
+        <button onClick={() => canvasRef.current?.redo()} style={{ padding: '4px 8px', cursor: 'pointer' }}>Redo</button>
         {/* New Save Button */}
         <button 
           onClick={handleSave} 

@@ -108,6 +108,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) =>
   const strokesRef = useRef(new Map());        // finalized strokes: id -> stroke
   const currentStrokeRef = useRef(null);       // my in-progress stroke
   const peerPreviewsRef = useRef(new Map());   // others' in-progress strokes: id -> preview
+  const undoStackRef = useRef([]);             // ids of MY strokes, in drawing order
+  const redoStackRef = useRef([]);             // full stroke objects I've undone
   const lastPreviewEmitRef = useRef(0);
   const rafRef = useRef(null);
 
@@ -134,7 +136,42 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) =>
     });
   };
 
+  const undo = () => {
+  while (undoStackRef.current.length) {
+    const id = undoStackRef.current.pop();
+    const stroke = strokesRef.current.get(id);
+    if (!stroke) continue; // already gone (e.g. board was cleared)
+    strokesRef.current.delete(id);
+    redoStackRef.current.push(stroke);
+    socket.emit('stroke:remove', { id });
+    scheduleRedraw();
+    return;
+  }
+};
+
+const redo = () => {
+  const stroke = redoStackRef.current.pop();
+  if (!stroke) return;
+  strokesRef.current.set(stroke.id, stroke);
+  undoStackRef.current.push(stroke.id);
+  socket.emit('stroke:end', stroke); // server and peers already handle this
+  scheduleRedraw();
+};
+
+useEffect(() => {
+  const onKey = (e) => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    const k = e.key.toLowerCase();
+    if (k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+    else if ((k === 'z' && e.shiftKey) || k === 'y') { e.preventDefault(); redo(); }
+  };
+  window.addEventListener('keydown', onKey);
+  return () => window.removeEventListener('keydown', onKey);
+}, []);
+
   useImperativeHandle(ref, () => ({
+    undo,
+    redo,
     saveToDatabase: async () => {
       try {
         const res = await fetch(`http://localhost:5000/api/boards/${roomId}`, {
@@ -157,7 +194,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) =>
     strokesRef.current = new Map();
     peerPreviewsRef.current = new Map();
     currentStrokeRef.current = null;
-
+    // undoStackRef.current = [];
+    // redoStackRef.current = [];
     // Full board from the server when joining
     const handleCatchUp = (strokes) => {
       strokesRef.current = new Map(strokes.map((s) => [s.id, s]));
@@ -179,9 +217,17 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) =>
       scheduleRedraw();
     };
 
+    const handleRemove = ({ id }) => {    
+      strokesRef.current.delete(id);    
+      peerPreviewsRef.current.delete(id)    ;
+      scheduleRedraw();
+    };
+
     const handleClear = () => {
       strokesRef.current.clear();
       peerPreviewsRef.current.clear();
+      undoStackRef.current = [];
+      redoStackRef.current = [];
       scheduleRedraw();
     };
 
@@ -199,6 +245,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) =>
     socket.on('stroke:end', handleEnd);
     socket.on('clear-board', handleClear);
     socket.on('peer-left', handlePeerLeft);
+    socket.on('stroke:remove', handleRemove);
     socket.emit('join-room', roomId);
 
     redrawAll();
@@ -209,6 +256,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) =>
       socket.off('stroke:end', handleEnd);
       socket.off('clear-board', handleClear);
       socket.off('peer-left', handlePeerLeft);
+      socket.off('stroke:remove', handleRemove);
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
@@ -281,6 +329,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId }, ref) =>
     };
 
     strokesRef.current.set(finalStroke.id, finalStroke);
+    undoStackRef.current.push(finalStroke.id);
+    redoStackRef.current = []; // a new stroke discards redo history
     socket.emit('stroke:end', finalStroke);
     scheduleRedraw();
   };

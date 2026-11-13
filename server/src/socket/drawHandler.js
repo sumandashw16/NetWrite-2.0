@@ -26,12 +26,28 @@ export default function registerDrawHandlers(io, socket) {
 
     try {
       const strokes = activeRoomsData.get(roomId) ?? (await loadRoom(roomId));
+      if (strokes.some((s) => s.id === stroke.id)) return; // ignore duplicates
       strokes.push(stroke);
+      (socket.data.ownIds ??= new Set()).add(stroke.id);   // remember who drew it
       markDirty(roomId);
       socket.to(roomId).emit('stroke:end', stroke);
     } catch (err) {
       console.error(`stroke:end failed for room ${roomId}:`, err);
     }
+  });
+
+  socket.on('stroke:remove', (payload) => {
+    const roomId = socket.data.roomId;
+    const id = payload?.id;
+    if (!roomId || typeof id !== 'string' || !socket.data.ownIds?.has(id)) return;
+
+    const strokes = activeRoomsData.get(roomId);
+    const i = strokes ? strokes.findIndex((s) => s.id === id) : -1;
+    if (i === -1) return;
+
+    strokes.splice(i, 1);
+    markDirty(roomId);
+    socket.to(roomId).emit('stroke:remove', { id });
   });
 
   socket.on('clear-board', async () => {
