@@ -11,6 +11,7 @@ const MAX_SCALE = 10;
 const HIT_TOLERANCE_PX = 4;       // extra click slop around a stroke (screen px)
 const DRAG_THRESHOLD_PX = 3;      // pointer must move this far before a click becomes a drag
 const SELECTION_COLOR = '#2563eb';
+const ERASER_RADIUS_PX = 8;       // eraser reach around the pointer (screen px)
 
 const round1 = (n) => Math.round(n * 10) / 10;
 
@@ -316,6 +317,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   onToolChangeRef.current = onToolChange;
   const onSelectionChangeRef = useRef(onSelectionChange);
   onSelectionChangeRef.current = onSelectionChange;
+  const eraserRef = useRef(null);   // last eraser position (world) while the eraser button is down
 
   // Refs, not state: drawing is imperative, and we don't want a React re-render per point.
   const strokesRef = useRef(new Map());        // finalized strokes: id -> stroke
@@ -434,11 +436,12 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   };
 
   const setTool = (tool) => {
-    if (tool !== 'select' && tool !== 'pen') return;
+    if (tool !== 'select' && tool !== 'pen' && tool !== 'eraser') return;
     activeToolRef.current = tool;
     setActiveTool(tool);
     interactionRef.current = null;
-    if (tool === 'pen' && selectedIdsRef.current.size) setSelection(new Set());
+    eraserRef.current = null;
+    if (tool !== 'select' && selectedIdsRef.current.size) setSelection(new Set());
     onToolChangeRef.current?.(tool);
     scheduleRedraw();
   };
@@ -454,6 +457,21 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     if (updates.length) socket.emit('stroke:update', { updates, final });
   };
 
+  // Delete every stroke under (wx, wy). Loops because strokes can overlap.
+  const eraseAt = (wx, wy) => {
+    const tolWorld = ERASER_RADIUS_PX / cameraRef.current.scale;
+    let erased = false;
+    let hit;
+    while ((hit = hitTestStrokes(strokesRef.current, wx, wy, tolWorld))) {
+      strokesRef.current.delete(hit.id);
+      socket.emit('stroke:delete', { roomId, id: hit.id });
+      erased = true;
+    }
+    if (erased) {
+      pruneSelection();
+      scheduleRedraw();
+    }
+  };
   const undo = () => {
     while (undoStackRef.current.length) {
       const id = undoStackRef.current.pop();
@@ -492,6 +510,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       const k = e.key.toLowerCase();
       if (k === 'v') setTool('select');
       else if (k === 'p') setTool('pen');
+      else if (k === 'e') setTool('eraser');
       else if (e.key === 'Escape' && selectedIdsRef.current.size) setSelection(new Set());
     };
     window.addEventListener('keydown', onKey);
@@ -643,6 +662,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     socket.on('peer-left', handlePeerLeft);
     socket.on('stroke:remove', handleRemove);
     socket.emit('join-room', roomId);
+    socket.on('stroke:delete', handleRemove);
 
     redrawAll();
 
@@ -654,6 +674,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       socket.off('clear-board', handleClear);
       socket.off('peer-left', handlePeerLeft);
       socket.off('stroke:remove', handleRemove);
+      socket.off('stroke:delete', handleRemove);
       canvas.removeEventListener('wheel', onWheel);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
@@ -728,6 +749,12 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       }
       return;
     }
+    // ---- Eraser tool: destroys objects, never creates strokes ----
+    if (activeToolRef.current === 'eraser') {
+      eraserRef.current = [wx, wy];
+      eraseAt(wx, wy);
+      return;
+    }
 
     // ---- Pen tool (unchanged) ----
     currentStrokeRef.current = {
@@ -790,7 +817,18 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       }
       return;
     }
-
+    // ---- Eraser tool ----
+    if (eraserRef.current) {
+      const [lx, ly] = eraserRef.current;
+      // A fast drag skips pixels, so test along the path in steps of one eraser radius
+      const step = ERASER_RADIUS_PX / cameraRef.current.scale;
+      const n = Math.max(1, Math.ceil(Math.hypot(x - lx, y - ly) / step));
+      for (let i = 1; i <= n; i++) {
+        eraseAt(lx + ((x - lx) * i) / n, ly + ((y - ly) * i) / n);
+      }
+      eraserRef.current = [x, y];
+      return;
+    }
     // ---- Pen tool (unchanged) ----
     const stroke = currentStrokeRef.current;
     if (!stroke) return;
@@ -827,6 +865,10 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       return;
     }
 
+    if (eraserRef.current) {
+      eraserRef.current = null;
+      return;
+    }
     // ---- Select tool ----
     const it = interactionRef.current;
     if (it) {
@@ -878,7 +920,9 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       onPointerCancel={handlePointerUp}
       onContextMenu={(e) => e.preventDefault()}
       data-selected-count={selectedIds.size}
-      className={`bg-white touch-none ${activeTool === 'pen' ? 'cursor-crosshair' : 'cursor-default'}`}
+      className={`bg-white touch-none ${
+        activeTool === 'select' ? 'cursor-default' : activeTool === 'eraser' ? 'cursor-cell' : 'cursor-crosshair'
+      }`}
     />
   );
 });

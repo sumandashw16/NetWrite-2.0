@@ -58,9 +58,7 @@ export default function Board() {
         <input type="color" value={color} onChange={(e) => setColor(e.target.value)} />
         <input type="range" min="1" max="20" value={brushSize} onChange={(e) => setBrushSize(parseInt(e.target.value))} />
         
-        <button onClick={() => setColor('#ffffff')} style={{ padding: '4px 8px', cursor: 'pointer' }}>
-          Eraser
-        </button>
+        <button {...toolBtn('eraser', 'Eraser')} title="Eraser (E)">🧽 Eraser</button>
         <button onClick={() => canvasRef.current?.undo()} style={{ padding: '4px 8px', cursor: 'pointer' }}>Undo</button> 
         <button onClick={() => canvasRef.current?.redo()} style={{ padding: '4px 8px', cursor: 'pointer' }}>Redo</button>
         <button onClick={() => canvasRef.current?.resetView()} style={{ padding: '4px 8px', cursor: 'pointer' }}>Reset view</button>

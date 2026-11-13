@@ -109,18 +109,18 @@ export default function registerDrawHandlers(io, socket) {
     socket.to(roomId).emit('stroke:update', { updates: applied, final });
   });
 
-  socket.on('stroke:remove', (payload) => {
-    const roomId = socket.data.roomId;
+  socket.on('stroke:delete', (payload) => {
+    const roomId = socket.data.roomId;      // trusted; the roomId in the payload is ignored
     const id = payload?.id;
-    if (!roomId || typeof id !== 'string' || !socket.data.ownIds?.has(id)) return;
+    if (!roomId || typeof id !== 'string') return;
 
     const strokes = activeRoomsData.get(roomId);
     const i = strokes ? strokes.findIndex((s) => s.id === id) : -1;
-    if (i === -1) return;
+    if (i === -1) return;                   // already deleted (two people erased it at once)
 
     strokes.splice(i, 1);
-    markDirty(roomId);
-    socket.to(roomId).emit('stroke:remove', { id });
+    markDirty(roomId);                      // flushRoom saves the whole array, so the deletion persists
+    socket.to(roomId).emit('stroke:delete', { id });
   });
 
   socket.on('clear-board', async () => {
