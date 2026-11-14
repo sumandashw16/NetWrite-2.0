@@ -64,7 +64,6 @@ export default function registerDrawHandlers(io, socket) {
 
       const clean = { ...stroke, ...sanitizeTransform(stroke) };
       strokes.push(clean);
-      (socket.data.ownIds ??= new Set()).add(clean.id);    // remember who drew it
       markDirty(roomId);
       socket.to(roomId).emit('stroke:end', clean);
     } catch (err) {

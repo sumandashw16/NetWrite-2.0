@@ -4,22 +4,36 @@ import { AuthContext } from '../../context/AuthContext';
 
 const MIN_POINT_DISTANCE = 1;     // 1px radial prefilter
 const PREVIEW_INTERVAL_MS = 40;   // throttle for stroke:preview
-const UPDATE_INTERVAL_MS = 40;    // throttle for stroke:update while dragging
+const UPDATE_INTERVAL_MS = 40;    // throttle for stroke:update while dragging/scaling/rotating
 const SIMPLIFY_EPSILON = 1.0;     // Douglas-Peucker tolerance (px)
-const MIN_SCALE = 0.1;
+const MIN_SCALE = 0.1;            // camera zoom clamp
 const MAX_SCALE = 10;
+const MIN_OBJECT_SCALE = 0.05;    // per-stroke scaleX/scaleY clamp (stays inside server's 0.01-100)
+const MAX_OBJECT_SCALE = 20;
 const HIT_TOLERANCE_PX = 4;       // extra click slop around a stroke (screen px)
 const DRAG_THRESHOLD_PX = 3;      // pointer must move this far before a click becomes a drag
 const SELECTION_COLOR = '#2563eb';
 const ERASER_RADIUS_PX = 8;       // eraser reach around the pointer (screen px)
 const OUTLINE_PAD_PX = 3;         // gap between the ink edge and the dashed outline (screen px)
 const SELECTION_DASH_PX = [6, 4]; // dash, gap (screen px)
-const MARCH_SPEED_PX = 20; // how fast the ants crawl (screen px per second)
+const MARCH_SPEED_PX = 20;        // how fast the ants crawl (screen px per second)
+const HANDLE_SIZE_PX = 9;         // resize handle square, screen px
+const MIN_GROUP_SIZE_PX = 12;     // selection box can't be resized smaller than this, screen px
+const ROTATE_HANDLE_OFFSET_PX = 24; // distance above the box, screen px
+const ROTATE_HANDLE_RADIUS_PX = 7;  // rotate handle hit/draw radius, screen px
+const ROTATE_SNAP_RAD = Math.PI / 12; // 15°, used when Shift is held
+
+// Per-handle sign for (pointer - anchor) along each axis, so the correct side always grows
+// and dragging past the anchor clamps instead of flipping/regrowing.
+const HANDLE_SIGNS = { nw: [-1, -1], ne: [1, -1], se: [1, 1], sw: [-1, 1] };
 
 const round1 = (n) => Math.round(n * 10) / 10;
+const round4 = (n) => Math.round(n * 10000) / 10000;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const prefersReducedMotion = () =>
   typeof window !== 'undefined' &&
   window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+
 // ---------------------------------------------------------------------------
 // Geometry simplification
 // ---------------------------------------------------------------------------
@@ -83,7 +97,8 @@ function simplify(points, epsilon) {
 //
 // Convention: a stroke's pivot is the center of its raw-points AABB.
 //   world = (center + [x, y]) + R(rotation) * S(scaleX, scaleY) * (local - center)
-// Raw points are never modified.
+// Raw points are never modified. Rendering transforms POINTS, not the canvas context,
+// so line width stays constant in world units regardless of an object's own scale.
 // ---------------------------------------------------------------------------
 
 // Local AABB cache, keyed by the points array. Valid ONLY for finalized strokes,
@@ -125,9 +140,29 @@ function getTransform(stroke) {
 const isIdentity = (t) =>
   t.x === 0 && t.y === 0 && t.scaleX === 1 && t.scaleY === 1 && t.rotation === 0;
 
-// The 4 corners of the (padded) local AABB, transformed into world space.
-// Padding is in local space, which is correct because ctx.scale also scales lineWidth.
-function getWorldCorners(stroke, pad = 0) {
+// Raw points -> world-space points, flat array. Used for rendering, hit testing and the outline,
+// so a stroke never needs ctx.scale()/ctx.rotate() to show its transform (keeps width constant).
+function transformPointsToWorld(stroke) {
+  const b = getLocalBounds(stroke);
+  const pts = stroke.points;
+  const t = getTransform(stroke);
+  const cx = (b.minX + b.maxX) / 2;
+  const cy = (b.minY + b.maxY) / 2;
+  const cos = Math.cos(t.rotation);
+  const sin = Math.sin(t.rotation);
+
+  const out = new Array(pts.length);
+  for (let i = 0; i < pts.length; i += 2) {
+    const sx = (pts[i] - cx) * t.scaleX;
+    const sy = (pts[i + 1] - cy) * t.scaleY;
+    out[i] = cx + t.x + sx * cos - sy * sin;
+    out[i + 1] = cy + t.y + sx * sin + sy * cos;
+  }
+  return out;
+}
+
+// The 4 corners of the local AABB, transformed into world space (no padding).
+function getWorldCorners(stroke) {
   const b = getLocalBounds(stroke);
   if (!b) return null;
 
@@ -137,13 +172,7 @@ function getWorldCorners(stroke, pad = 0) {
   const cos = Math.cos(rotation);
   const sin = Math.sin(rotation);
 
-  const locals = [
-    [b.minX - pad, b.minY - pad],
-    [b.maxX + pad, b.minY - pad],
-    [b.maxX + pad, b.maxY + pad],
-    [b.minX - pad, b.maxY + pad]
-  ];
-
+  const locals = [[b.minX, b.minY], [b.maxX, b.minY], [b.maxX, b.maxY], [b.minX, b.maxY]];
   return locals.map(([lx, ly]) => {
     const sx = (lx - cx) * scaleX;
     const sy = (ly - cy) * scaleY;
@@ -151,70 +180,76 @@ function getWorldCorners(stroke, pad = 0) {
   });
 }
 
-// Inverse transform: world point -> the stroke's local space. null if the scale is degenerate.
-function worldToLocal(stroke, wx, wy) {
+// Axis-aligned world-space bounds, optionally padded by a constant WORLD-unit amount
+// (e.g. half the stroke width, which no longer scales with the object).
+function getWorldBounds(stroke, pad = 0) {
   const b = getLocalBounds(stroke);
   if (!b) return null;
 
-  const cx = (b.minX + b.maxX) / 2;
-  const cy = (b.minY + b.maxY) / 2;
-  const { x, y, scaleX, scaleY, rotation } = getTransform(stroke);
-  if (!scaleX || !scaleY) return null;
+  const t = getTransform(stroke);
+  let minX, minY, maxX, maxY;
 
-  const dx = wx - (cx + x);
-  const dy = wy - (cy + y);
-  const cos = Math.cos(-rotation);
-  const sin = Math.sin(-rotation);
-  const rx = dx * cos - dy * sin;
-  const ry = dx * sin + dy * cos;
-  return [cx + rx / scaleX, cy + ry / scaleY];
+  if (isIdentity(t)) {
+    ({ minX, minY, maxX, maxY } = b);
+  } else {
+    const corners = getWorldCorners(stroke);
+    minX = Infinity; minY = Infinity; maxX = -Infinity; maxY = -Infinity;
+    for (const [cx, cy] of corners) {
+      if (cx < minX) minX = cx;
+      if (cx > maxX) maxX = cx;
+      if (cy < minY) minY = cy;
+      if (cy > maxY) maxY = cy;
+    }
+  }
+  if (pad) { minX -= pad; minY -= pad; maxX += pad; maxY += pad; }
+  return { minX, minY, maxX, maxY };
+}
+
+// Union of getWorldBounds over a set of stroke ids (the "group" box for the selection).
+// Always axis-aligned, even if members are rotated (a "loose" box in that case).
+function getGroupBoundsWorld(strokesMap, ids) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const id of ids) {
+    const s = strokesMap.get(id);
+    if (!s) continue;
+    const b = getWorldBounds(s, (s.width ?? 1) / 2);
+    if (!b) continue;
+    if (b.minX < minX) minX = b.minX;
+    if (b.maxX > maxX) maxX = b.maxX;
+    if (b.minY < minY) minY = b.minY;
+    if (b.maxY > maxY) maxY = b.maxY;
+  }
+  return minX === Infinity ? null : { minX, minY, maxX, maxY };
 }
 
 // Topmost stroke under the pointer (iterates in reverse draw order).
-// Two-phase: AABB broad-phase, then distance-to-polyline narrow-phase.
+// Broad phase: padded world AABB. Narrow phase: distance to the world-space polyline.
 function hitTestStrokes(strokesMap, wx, wy, tolWorld) {
   const list = Array.from(strokesMap.values());
   for (let i = list.length - 1; i >= 0; i--) {
     const s = list[i];
-    const b = getLocalBounds(s);
-    if (!b) continue;
-    const local = worldToLocal(s, wx, wy);
-    if (!local) continue;
-
     const t = getTransform(s);
-    const minScale = Math.min(Math.abs(t.scaleX), Math.abs(t.scaleY)) || 1;
-    // Tolerance in local space: half the stroke width + screen-space slop
-    const hitRadius = (s.width ?? 1) / 2 + tolWorld / minScale;
+    const hitRadius = (s.width ?? 1) / 2 + tolWorld;
+
+    const b = getWorldBounds(s, hitRadius);
+    if (!b) continue;
+    if (wx < b.minX || wx > b.maxX || wy < b.minY || wy > b.maxY) continue;
+
+    const world = isIdentity(t) ? s.points : transformPointsToWorld(s);
+    const n = world.length / 2;
     const hitRadiusSq = hitRadius * hitRadius;
 
-    // --- Broad phase: padded AABB in local space ---
-    const [lx, ly] = local;
-    if (
-      lx < b.minX - hitRadius || lx > b.maxX + hitRadius ||
-      ly < b.minY - hitRadius || ly > b.maxY + hitRadius
-    ) continue;
-
-    // --- Narrow phase: distance to the actual polyline path ---
-    const pts = s.points;
-    const n = pts.length / 2;
-
-    // Single dot: distance to the single point
     if (n === 1) {
-      const dx = lx - pts[0];
-      const dy = ly - pts[1];
+      const dx = wx - world[0], dy = wy - world[1];
       if (dx * dx + dy * dy <= hitRadiusSq) return s;
       continue;
     }
 
-    // Walk every segment and test distance to it
     let hit = false;
     for (let j = 0; j < n - 1; j++) {
-      const ax = pts[j * 2],     ay = pts[j * 2 + 1];
-      const bx = pts[j * 2 + 2], by = pts[j * 2 + 3];
-      if (sqSegDist(lx, ly, ax, ay, bx, by) <= hitRadiusSq) {
-        hit = true;
-        break;
-      }
+      const ax = world[j * 2], ay = world[j * 2 + 1];
+      const bx = world[j * 2 + 2], by = world[j * 2 + 3];
+      if (sqSegDist(wx, wy, ax, ay, bx, by) <= hitRadiusSq) { hit = true; break; }
     }
     if (hit) return s;
   }
@@ -228,110 +263,131 @@ function strokesInRect(strokesMap, x0, y0, x1, y1) {
   const hits = [];
 
   for (const s of strokesMap.values()) {
-    const corners = getWorldCorners(s, (s.width ?? 1) / 2);
-    if (!corners) continue;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const [cx, cy] of corners) {
-      if (cx < minX) minX = cx;
-      if (cx > maxX) maxX = cx;
-      if (cy < minY) minY = cy;
-      if (cy > maxY) maxY = cy;
-    }
-    if (minX <= rMaxX && maxX >= rMinX && minY <= rMaxY && maxY >= rMinY) hits.push(s.id);
+    const b = getWorldBounds(s, (s.width ?? 1) / 2);
+    if (!b) continue;
+    if (b.minX <= rMaxX && b.maxX >= rMinX && b.minY <= rMaxY && b.maxY >= rMinY) hits.push(s.id);
   }
   return hits;
 }
 
-// Closed outline polygon hugging the stroke's ink, returned in WORLD space.
-// Offsets the polyline by (width/2 + pad) on both sides and joins them with round caps.
-function getStrokeOutlineWorld(stroke, padPx, cameraScale) {
-  const b = getLocalBounds(stroke);
-  if (!b) return null;
+// Which corner handle (if any) of a world-space box the pointer is over
+function hitTestHandles(bounds, wx, wy, cameraScale) {
+  const hs = HANDLE_SIZE_PX / cameraScale / 2;
+  const corners = {
+    nw: [bounds.minX, bounds.minY],
+    ne: [bounds.maxX, bounds.minY],
+    se: [bounds.maxX, bounds.maxY],
+    sw: [bounds.minX, bounds.maxY]
+  };
+  for (const [key, [hx, hy]] of Object.entries(corners)) {
+    if (Math.abs(wx - hx) <= hs && Math.abs(wy - hy) <= hs) return key;
+  }
+  return null;
+}
 
+function oppositeCorner(handle, bounds) {
+  switch (handle) {
+    case 'nw': return [bounds.maxX, bounds.maxY];
+    case 'ne': return [bounds.minX, bounds.maxY];
+    case 'se': return [bounds.minX, bounds.minY];
+    case 'sw': return [bounds.maxX, bounds.minY];
+    default: return [bounds.minX, bounds.minY];
+  }
+}
+
+const cursorForHandle = (handle) => (handle === 'nw' || handle === 'se' ? 'nwse-resize' : 'nesw-resize');
+
+// Rotate handle position: centered above the box
+function getRotateHandlePos(bounds, cameraScale) {
+  const cx = (bounds.minX + bounds.maxX) / 2;
+  const hy = bounds.minY - ROTATE_HANDLE_OFFSET_PX / cameraScale;
+  return [cx, hy];
+}
+
+function hitTestRotateHandle(bounds, wx, wy, cameraScale) {
+  const [hx, hy] = getRotateHandlePos(bounds, cameraScale);
+  const r = ROTATE_HANDLE_RADIUS_PX / cameraScale;
+  const dx = wx - hx, dy = wy - hy;
+  return dx * dx + dy * dy <= r * r;
+}
+
+// Closed outline polygon hugging the stroke's ink, in WORLD space. Offsets the
+// (already world-space) polyline by a constant radius and joins with round caps.
+function getStrokeOutlineWorld(stroke, padPx, cameraScale) {
   const t = getTransform(stroke);
-  const objScale = (Math.abs(t.scaleX) + Math.abs(t.scaleY)) / 2 || 1;
-  const r = (stroke.width ?? 1) / 2 + padPx / (cameraScale * objScale); // local-space radius
+  const worldPts = isIdentity(t) ? stroke.points : transformPointsToWorld(stroke);
+  const r = (stroke.width ?? 1) / 2 + padPx / cameraScale; // constant world-space radius
 
   // Drop duplicate points (rounding to 1 decimal can create them)
-  const src = stroke.points;
   const pts = [];
-  for (let i = 0; i < src.length; i += 2) {
+  for (let i = 0; i < worldPts.length; i += 2) {
     const last = pts[pts.length - 1];
-    if (!last || Math.hypot(src[i] - last[0], src[i + 1] - last[1]) > 1e-6) {
-      pts.push([src[i], src[i + 1]]);
+    if (!last || Math.hypot(worldPts[i] - last[0], worldPts[i + 1] - last[1]) > 1e-6) {
+      pts.push([worldPts[i], worldPts[i + 1]]);
     }
   }
+  if (pts.length === 0) return null;
 
-  const local = [];
+  const outline = [];
   const CAP_STEPS = 10;
   const arc = (cx, cy, a0, a1, steps) => {
     for (let i = 0; i <= steps; i++) {
       const a = a0 + ((a1 - a0) * i) / steps;
-      local.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
+      outline.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
     }
   };
 
   if (pts.length === 1) {
     arc(pts[0][0], pts[0][1], 0, Math.PI * 2, 24);
-  } else {
-    // Unit normals per segment
-    const normals = [];
-    for (let i = 0; i < pts.length - 1; i++) {
-      const dx = pts[i + 1][0] - pts[i][0];
-      const dy = pts[i + 1][1] - pts[i][1];
-      const len = Math.hypot(dx, dy);
-      normals.push([-dy / len, dx / len]);
-    }
-
-    // Per-vertex normal (averaged, miter length clamped) -> left and right offset points
-    const left = [], right = [];
-    for (let i = 0; i < pts.length; i++) {
-      let nx, ny, scale = 1;
-      if (i === 0) [nx, ny] = normals[0];
-      else if (i === pts.length - 1) [nx, ny] = normals[normals.length - 1];
-      else {
-        const [ax, ay] = normals[i - 1];
-        const [bx, by] = normals[i];
-        nx = ax + bx; ny = ay + by;
-        const len = Math.hypot(nx, ny) || 1;
-        nx /= len; ny /= len;
-        const d = nx * bx + ny * by;
-        scale = Math.min(2, 1 / Math.max(d, 0.5)); // clamp so sharp corners don't spike
-      }
-      left.push([pts[i][0] + nx * r * scale, pts[i][1] + ny * r * scale]);
-      right.push([pts[i][0] - nx * r * scale, pts[i][1] - ny * r * scale]);
-    }
-
-    const last = pts.length - 1;
-    const endA = Math.atan2(normals[normals.length - 1][1], normals[normals.length - 1][0]);
-    const startA = Math.atan2(normals[0][1], normals[0][0]);
-
-    for (const p of left) local.push(p);                                  // left side, forward
-    arc(pts[last][0], pts[last][1], endA, endA - Math.PI, CAP_STEPS);     // end cap
-    for (let i = right.length - 1; i >= 0; i--) local.push(right[i]);     // right side, backward
-    arc(pts[0][0], pts[0][1], startA + Math.PI, startA, CAP_STEPS);       // start cap
+    return outline;
   }
 
-  // Local -> world (same math as getWorldCorners)
-  const cx = (b.minX + b.maxX) / 2;
-  const cy = (b.minY + b.maxY) / 2;
-  const cos = Math.cos(t.rotation);
-  const sin = Math.sin(t.rotation);
-  return local.map(([lx, ly]) => {
-    const sx = (lx - cx) * t.scaleX;
-    const sy = (ly - cy) * t.scaleY;
-    return [cx + t.x + sx * cos - sy * sin, cy + t.y + sx * sin + sy * cos];
-  });
+  const normals = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const dx = pts[i + 1][0] - pts[i][0];
+    const dy = pts[i + 1][1] - pts[i][1];
+    const len = Math.hypot(dx, dy) || 1;
+    normals.push([-dy / len, dx / len]);
+  }
+
+  const left = [], right = [];
+  for (let i = 0; i < pts.length; i++) {
+    let nx, ny, scale = 1;
+    if (i === 0) [nx, ny] = normals[0];
+    else if (i === pts.length - 1) [nx, ny] = normals[normals.length - 1];
+    else {
+      const [ax, ay] = normals[i - 1];
+      const [bx, by] = normals[i];
+      nx = ax + bx; ny = ay + by;
+      const len = Math.hypot(nx, ny) || 1;
+      nx /= len; ny /= len;
+      const d = nx * bx + ny * by;
+      scale = Math.min(2, 1 / Math.max(d, 0.5)); // clamp so sharp corners don't spike
+    }
+    left.push([pts[i][0] + nx * r * scale, pts[i][1] + ny * r * scale]);
+    right.push([pts[i][0] - nx * r * scale, pts[i][1] - ny * r * scale]);
+  }
+
+  const last = pts.length - 1;
+  const endA = Math.atan2(normals[normals.length - 1][1], normals[normals.length - 1][0]);
+  const startA = Math.atan2(normals[0][1], normals[0][0]);
+
+  for (const p of left) outline.push(p);
+  arc(pts[last][0], pts[last][1], endA, endA - Math.PI, CAP_STEPS);
+  for (let i = right.length - 1; i >= 0; i--) outline.push(right[i]);
+  arc(pts[0][0], pts[0][1], startA + Math.PI, startA, CAP_STEPS);
+
+  return outline;
 }
 
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
-// Draws the raw points, smoothed with quadratic curves through midpoints
-function drawRawStroke(ctx, stroke) {
-  const { points, color, width } = stroke;
+// Draws a flat points array, smoothed with quadratic curves through midpoints
+function drawRawStroke(ctx, points, color, width) {
   const n = points.length / 2;
+  if (n === 0) return;
 
   ctx.strokeStyle = color;
   ctx.fillStyle = color;
@@ -339,7 +395,6 @@ function drawRawStroke(ctx, stroke) {
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
 
-  // Single click: draw a dot
   if (n === 1) {
     ctx.beginPath();
     ctx.arc(points[0], points[1], width / 2, 0, Math.PI * 2);
@@ -365,27 +420,13 @@ function drawRawStroke(ctx, stroke) {
   ctx.stroke();
 }
 
-// Draw one stroke with its non-destructive transform applied
+// Draw one stroke with its non-destructive transform applied. Transforms the POINTS
+// (not the canvas context), so lineWidth never gets stretched by an object's own scale.
 function drawStroke(ctx, stroke) {
   if (!stroke.points || stroke.points.length === 0) return;
-
   const t = getTransform(stroke);
-  if (isIdentity(t)) {
-    drawRawStroke(ctx, stroke); // fast path; also covers live/preview strokes
-    return;
-  }
-
-  const b = getLocalBounds(stroke);
-  const cx = (b.minX + b.maxX) / 2;
-  const cy = (b.minY + b.maxY) / 2;
-
-  ctx.save();
-  ctx.translate(cx + t.x, cy + t.y);
-  ctx.rotate(t.rotation);
-  ctx.scale(t.scaleX, t.scaleY);
-  ctx.translate(-cx, -cy);
-  drawRawStroke(ctx, stroke);
-  ctx.restore();
+  const pts = isIdentity(t) ? stroke.points : transformPointsToWorld(stroke);
+  drawRawStroke(ctx, pts, stroke.color, stroke.width);
 }
 
 // ---------------------------------------------------------------------------
@@ -410,8 +451,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   const strokesRef = useRef(new Map());        // finalized strokes: id -> stroke
   const currentStrokeRef = useRef(null);       // my in-progress stroke
   const peerPreviewsRef = useRef(new Map());   // others' in-progress strokes: id -> preview
-  const undoStackRef = useRef([]);             // ids of MY strokes, in drawing order
-  const redoStackRef = useRef([]);             // full stroke objects I've undone
+  const undoStackRef = useRef([]);             // entries: { type:'draw', id } | { type:'transform', changes }
+  const redoStackRef = useRef([]);             // entries: { type:'draw', stroke } | { type:'transform', changes }
   const lastPreviewEmitRef = useRef(0);
   const lastUpdateEmitRef = useRef(0);
   const rafRef = useRef(null);
@@ -423,8 +464,10 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const selectedIdsRef = useRef(new Set());
 
-  // Active drag / marquee. Mutated on every pointer move, so a ref.
-  //   { type: 'drag', startWorld, startClient, starts: Map(id -> {x, y}), moved, collapseTo }
+  // Active drag / scale / rotate / marquee. Mutated on every pointer move, so a ref.
+  //   { type: 'drag',   startWorld, startClient, starts: Map(id -> {x,y}), moved, collapseTo }
+  //   { type: 'scale',  handle, anchor: [x,y], startBounds, starts: Map(id -> {x,y,scaleX,scaleY,centerX,centerY}) }
+  //   { type: 'rotate', pivot: [x,y], startAngle, starts: Map(id -> {x,y,rotation,centerX,centerY}) }
   //   { type: 'marquee', start, current, base: Set }
   const interactionRef = useRef(null);
 
@@ -445,8 +488,9 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     for (const preview of peerPreviewsRef.current.values()) drawStroke(ctx, preview);
     if (currentStrokeRef.current) drawStroke(ctx, currentStrokeRef.current);
 
-    // Selection outlines: animated dashed border hugging each selected stroke's ink
     const selected = selectedIdsRef.current;
+
+    // Selection outlines: animated dashed border hugging each selected stroke's ink
     if (selected.size) {
       const period = SELECTION_DASH_PX[0] + SELECTION_DASH_PX[1];
       const phase = ((performance.now() / 1000) * MARCH_SPEED_PX) % period; // wrap to avoid huge numbers
@@ -469,6 +513,46 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
         ctx.stroke();
       }
       ctx.restore();
+
+      const bounds = getGroupBoundsWorld(strokesRef.current, selected);
+      if (bounds) {
+        // Corner (resize) handles
+        const hs = HANDLE_SIZE_PX / scale / 2;
+        const corners = [
+          [bounds.minX, bounds.minY], [bounds.maxX, bounds.minY],
+          [bounds.maxX, bounds.maxY], [bounds.minX, bounds.maxY]
+        ];
+        ctx.save();
+        ctx.fillStyle = '#fff';
+        ctx.strokeStyle = SELECTION_COLOR;
+        ctx.lineWidth = 1.5 / scale;
+        for (const [hx, hy] of corners) {
+          ctx.beginPath();
+          ctx.rect(hx - hs, hy - hs, hs * 2, hs * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+        ctx.restore();
+
+        // Rotate handle: small circle above the box, with a connecting line
+        const [rhx, rhy] = getRotateHandlePos(bounds, scale);
+        const topCenterX = (bounds.minX + bounds.maxX) / 2;
+        const r = ROTATE_HANDLE_RADIUS_PX / scale;
+        ctx.save();
+        ctx.strokeStyle = SELECTION_COLOR;
+        ctx.lineWidth = 1 / scale;
+        ctx.beginPath();
+        ctx.moveTo(topCenterX, bounds.minY);
+        ctx.lineTo(rhx, rhy);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(rhx, rhy, r, 0, Math.PI * 2);
+        ctx.fillStyle = '#fff';
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+      }
     }
 
     // Marquee
@@ -486,6 +570,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       ctx.strokeRect(rx, ry, rw, rh);
       ctx.restore();
     }
+
     // Marching ants: keep requesting frames only while something is selected.
     // When the selection empties, the loop stops by itself.
     if (selectedIdsRef.current.size && !prefersReducedMotion()) scheduleRedraw();
@@ -541,13 +626,18 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     scheduleRedraw();
   };
 
-  // Send absolute x/y for the given ids as one batched message
+  // Send absolute x/y/scaleX/scaleY/rotation for the given ids as one batched message
   const emitUpdates = (ids, final) => {
     const updates = [];
     for (const id of ids) {
       const s = strokesRef.current.get(id);
       if (!s) continue;
-      updates.push({ id, x: s.x ?? 0, y: s.y ?? 0 });
+      updates.push({
+        id,
+        x: s.x ?? 0, y: s.y ?? 0,
+        scaleX: s.scaleX ?? 1, scaleY: s.scaleY ?? 1,
+        rotation: s.rotation ?? 0
+      });
     }
     if (updates.length) socket.emit('stroke:update', { updates, final });
   };
@@ -567,27 +657,70 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       scheduleRedraw();
     }
   };
+
+  // Set x/y/scaleX/scaleY/rotation on existing strokes from a transform entry
+  // ('from' = undo, 'to' = redo), then sync peers. Returns false if nothing applied
+  // (e.g. every stroke in the entry was erased since).
+  const applyTransform = (changes, key) => {
+    const ids = [];
+    for (const c of changes) {
+      const s = strokesRef.current.get(c.id);
+      if (!s) continue;
+      const v = c[key];
+      s.x = v.x;
+      s.y = v.y;
+      if (v.scaleX !== undefined) s.scaleX = v.scaleX;
+      if (v.scaleY !== undefined) s.scaleY = v.scaleY;
+      if (v.rotation !== undefined) s.rotation = v.rotation;
+      ids.push(c.id);
+    }
+    if (!ids.length) return false;
+    emitUpdates(ids, true);
+    scheduleRedraw();
+    return true;
+  };
+
   const undo = () => {
     while (undoStackRef.current.length) {
-      const id = undoStackRef.current.pop();
-      const stroke = strokesRef.current.get(id);
-      if (!stroke) continue; // already gone (e.g. board was cleared)
-      strokesRef.current.delete(id);
-      redoStackRef.current.push(stroke);
-      socket.emit('stroke:remove', { id });
-      pruneSelection();
-      scheduleRedraw();
-      return;
+      const entry = undoStackRef.current.pop();
+
+      if (entry.type === 'draw') {
+        const stroke = strokesRef.current.get(entry.id);
+        if (!stroke) continue;                         // already gone, try the next entry
+        strokesRef.current.delete(entry.id);
+        redoStackRef.current.push({ type: 'draw', stroke });
+        socket.emit('stroke:delete', { id: entry.id });
+        pruneSelection();
+        scheduleRedraw();
+        return;
+      }
+
+      if (entry.type === 'transform') {
+        if (!applyTransform(entry.changes, 'from')) continue;
+        redoStackRef.current.push(entry);
+        return;
+      }
     }
   };
 
   const redo = () => {
-    const stroke = redoStackRef.current.pop();
-    if (!stroke) return;
-    strokesRef.current.set(stroke.id, stroke);
-    undoStackRef.current.push(stroke.id);
-    socket.emit('stroke:end', stroke); // server and peers already handle this (transform included)
-    scheduleRedraw();
+    while (redoStackRef.current.length) {
+      const entry = redoStackRef.current.pop();
+
+      if (entry.type === 'draw') {
+        strokesRef.current.set(entry.stroke.id, entry.stroke);
+        undoStackRef.current.push({ type: 'draw', id: entry.stroke.id });
+        socket.emit('stroke:end', entry.stroke); // server and peers already handle this (transform included)
+        scheduleRedraw();
+        return;
+      }
+
+      if (entry.type === 'transform') {
+        if (!applyTransform(entry.changes, 'to')) continue;
+        undoStackRef.current.push(entry);
+        return;
+      }
+    }
   };
 
   useEffect(() => {
@@ -673,12 +806,12 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       scheduleRedraw();
     };
 
-    // A peer moved some strokes: absolute values, so just assign
+    // A peer moved/scaled/rotated some strokes: absolute values, so just assign
     const handleUpdate = ({ updates }) => {
       if (!Array.isArray(updates)) return;
-      const dragging = interactionRef.current?.type === 'drag' ? interactionRef.current.starts : null;
+      const interacting = interactionRef.current?.starts ?? null; // my own drag/scale/rotate in progress
       for (const u of updates) {
-        if (dragging?.has(u.id)) continue; // I'm dragging it right now; my local state wins, no jitter
+        if (interacting?.has(u.id)) continue; // I'm transforming it right now; my local state wins, no jitter
         const stroke = strokesRef.current.get(u.id);
         if (!stroke) continue;
         if (Number.isFinite(u.x)) stroke.x = u.x;
@@ -755,9 +888,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     socket.on('stroke:update', handleUpdate);
     socket.on('clear-board', handleClear);
     socket.on('peer-left', handlePeerLeft);
-    socket.on('stroke:remove', handleRemove);
-    socket.emit('join-room', roomId);
     socket.on('stroke:delete', handleRemove);
+    socket.emit('join-room', roomId);
 
     redrawAll();
 
@@ -768,7 +900,6 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       socket.off('stroke:update', handleUpdate);
       socket.off('clear-board', handleClear);
       socket.off('peer-left', handlePeerLeft);
-      socket.off('stroke:remove', handleRemove);
       socket.off('stroke:delete', handleRemove);
       canvas.removeEventListener('wheel', onWheel);
       window.removeEventListener('keydown', onKeyDown);
@@ -797,9 +928,61 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
 
     // ---- Select tool ----
     if (activeToolRef.current === 'select') {
+      const selected = selectedIdsRef.current;
+
+      // Handles take priority over everything else when a selection exists
+      if (selected.size) {
+        const bounds = getGroupBoundsWorld(strokesRef.current, selected);
+
+        const handle = bounds ? hitTestHandles(bounds, wx, wy, cameraRef.current.scale) : null;
+        if (handle) {
+          const starts = new Map();
+          for (const id of selected) {
+            const s = strokesRef.current.get(id);
+            const b = s && getLocalBounds(s);
+            if (!b) continue;
+            starts.set(id, {
+              x: s.x ?? 0, y: s.y ?? 0,
+              scaleX: s.scaleX ?? 1, scaleY: s.scaleY ?? 1,
+              centerX: (b.minX + b.maxX) / 2, centerY: (b.minY + b.maxY) / 2
+            });
+          }
+          interactionRef.current = {
+            type: 'scale', handle, anchor: oppositeCorner(handle, bounds), startBounds: bounds, starts
+          };
+          lastUpdateEmitRef.current = 0;
+          canvasRef.current.style.cursor = cursorForHandle(handle);
+          return;
+        }
+
+        if (bounds && hitTestRotateHandle(bounds, wx, wy, cameraRef.current.scale)) {
+          const pivotX = (bounds.minX + bounds.maxX) / 2;
+          const pivotY = (bounds.minY + bounds.maxY) / 2;
+          const starts = new Map();
+          for (const id of selected) {
+            const s = strokesRef.current.get(id);
+            const b = s && getLocalBounds(s);
+            if (!b) continue;
+            starts.set(id, {
+              x: s.x ?? 0, y: s.y ?? 0,
+              rotation: s.rotation ?? 0,
+              centerX: (b.minX + b.maxX) / 2, centerY: (b.minY + b.maxY) / 2
+            });
+          }
+          interactionRef.current = {
+            type: 'rotate',
+            pivot: [pivotX, pivotY],
+            startAngle: Math.atan2(wy - pivotY, wx - pivotX),
+            starts
+          };
+          lastUpdateEmitRef.current = 0;
+          canvasRef.current.style.cursor = 'grabbing';
+          return;
+        }
+      }
+
       const tolWorld = HIT_TOLERANCE_PX / cameraRef.current.scale;
       const hit = hitTestStrokes(strokesRef.current, wx, wy, tolWorld);
-      const selected = selectedIdsRef.current;
 
       if (hit) {
         let collapseTo = null;
@@ -844,6 +1027,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       }
       return;
     }
+
     // ---- Eraser tool: destroys objects, never creates strokes ----
     if (activeToolRef.current === 'eraser') {
       eraserRef.current = [wx, wy];
@@ -879,10 +1063,86 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       return;
     }
 
-    // ---- Select tool interactions ----
     const it = interactionRef.current;
+
+    // Hover feedback for resize/rotate handles, when idle with a selection
+    if (!it && activeToolRef.current === 'select' && selectedIdsRef.current.size) {
+      const bounds = getGroupBoundsWorld(strokesRef.current, selectedIdsRef.current);
+      if (bounds) {
+        const handle = hitTestHandles(bounds, x, y, cameraRef.current.scale);
+        if (handle) canvasRef.current.style.cursor = cursorForHandle(handle);
+        else if (hitTestRotateHandle(bounds, x, y, cameraRef.current.scale)) canvasRef.current.style.cursor = 'grab';
+        else canvasRef.current.style.cursor = '';
+      } else {
+        canvasRef.current.style.cursor = '';
+      }
+    }
+
+    // ---- Select tool interactions ----
     if (it) {
-      if (it.type === 'drag') {
+      if (it.type === 'scale') {
+        const { minX, minY, maxX, maxY } = it.startBounds;
+        const startW = Math.max(maxX - minX, 1e-6);
+        const startH = Math.max(maxY - minY, 1e-6);
+        const [ax, ay] = it.anchor;
+        const [signX, signY] = HANDLE_SIGNS[it.handle];
+        const minSize = MIN_GROUP_SIZE_PX / cameraRef.current.scale;
+
+        // Directional (not abs) diffs: dragging past the anchor clamps at minSize
+        // instead of shrinking to 0 and re-growing (which would look like a flip).
+        const newW = Math.max(signX * (x - ax), minSize);
+        const newH = Math.max(signY * (y - ay), minSize);
+        let gsx = newW / startW;
+        let gsy = newH / startH;
+        if (e.shiftKey) { const g = Math.max(gsx, gsy); gsx = gsy = g; } // uniform scale
+
+        for (const [id, st] of it.starts) {
+          const s = strokesRef.current.get(id);
+          if (!s) continue;
+          const worldCenterX0 = st.centerX + st.x;
+          const worldCenterY0 = st.centerY + st.y;
+          const newCenterX = ax + (worldCenterX0 - ax) * gsx;
+          const newCenterY = ay + (worldCenterY0 - ay) * gsy;
+          s.x = round1(newCenterX - st.centerX);
+          s.y = round1(newCenterY - st.centerY);
+          s.scaleX = round4(clamp(st.scaleX * gsx, MIN_OBJECT_SCALE, MAX_OBJECT_SCALE));
+          s.scaleY = round4(clamp(st.scaleY * gsy, MIN_OBJECT_SCALE, MAX_OBJECT_SCALE));
+        }
+
+        const now = performance.now();
+        if (now - lastUpdateEmitRef.current >= UPDATE_INTERVAL_MS) {
+          lastUpdateEmitRef.current = now;
+          emitUpdates(it.starts.keys(), false);
+        }
+        scheduleRedraw();
+      } else if (it.type === 'rotate') {
+        const [px, py] = it.pivot;
+        const angle = Math.atan2(y - py, x - px);
+        let delta = angle - it.startAngle;
+        if (e.shiftKey) delta = Math.round(delta / ROTATE_SNAP_RAD) * ROTATE_SNAP_RAD;
+        
+        const cos = Math.cos(delta), sin = Math.sin(delta);
+        for (const [id, st] of it.starts) {
+          const s = strokesRef.current.get(id);
+          if (!s) continue;
+          const worldCenterX0 = st.centerX + st.x;
+          const worldCenterY0 = st.centerY + st.y;
+          const dx = worldCenterX0 - px;
+          const dy = worldCenterY0 - py;
+          const newCenterX = px + dx * cos - dy * sin;
+          const newCenterY = py + dx * sin + dy * cos;
+          s.x = round1(newCenterX - st.centerX);
+          s.y = round1(newCenterY - st.centerY);
+          s.rotation = round4(st.rotation + delta);
+        }
+
+        const now = performance.now();
+        if (now - lastUpdateEmitRef.current >= UPDATE_INTERVAL_MS) {
+          lastUpdateEmitRef.current = now;
+          emitUpdates(it.starts.keys(), false);
+        }
+        scheduleRedraw();
+      } else if (it.type === 'drag') {
         if (!it.moved) {
           const dxs = e.clientX - it.startClient[0];
           const dys = e.clientY - it.startClient[1];
@@ -912,6 +1172,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       }
       return;
     }
+
     // ---- Eraser tool ----
     if (eraserRef.current) {
       const [lx, ly] = eraserRef.current;
@@ -924,6 +1185,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       eraserRef.current = [x, y];
       return;
     }
+
     // ---- Pen tool (unchanged) ----
     const stroke = currentStrokeRef.current;
     if (!stroke) return;
@@ -964,15 +1226,60 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       eraserRef.current = null;
       return;
     }
+
     // ---- Select tool ----
     const it = interactionRef.current;
     if (it) {
       interactionRef.current = null;
       canvasRef.current.style.cursor = spaceRef.current ? 'grab' : '';
 
-      if (it.type === 'drag') {
+      if (it.type === 'scale') {
+        const changes = [];
+        for (const [id, st] of it.starts) {
+          const s = strokesRef.current.get(id);
+          if (!s) continue;
+          const from = { x: st.x, y: st.y, scaleX: st.scaleX, scaleY: st.scaleY };
+          const to = { x: s.x ?? 0, y: s.y ?? 0, scaleX: s.scaleX ?? 1, scaleY: s.scaleY ?? 1 };
+          if (to.x !== from.x || to.y !== from.y || to.scaleX !== from.scaleX || to.scaleY !== from.scaleY) {
+            changes.push({ id, from, to });
+          }
+        }
+        if (changes.length) {
+          undoStackRef.current.push({ type: 'transform', changes });
+          redoStackRef.current = []; // a new action discards redo history
+        }
+        emitUpdates(it.starts.keys(), true); // guaranteed trailing emit: peers end exactly in sync
+      } else if (it.type === 'rotate') {
+        const changes = [];
+        for (const [id, st] of it.starts) {
+          const s = strokesRef.current.get(id);
+          if (!s) continue;
+          const from = { x: st.x, y: st.y, rotation: st.rotation };
+          const to = { x: s.x ?? 0, y: s.y ?? 0, rotation: s.rotation ?? 0 };
+          if (to.x !== from.x || to.y !== from.y || to.rotation !== from.rotation) {
+            changes.push({ id, from, to });
+          }
+        }
+        if (changes.length) {
+          undoStackRef.current.push({ type: 'transform', changes });
+          redoStackRef.current = [];
+        }
+        emitUpdates(it.starts.keys(), true);
+      } else if (it.type === 'drag') {
         if (it.moved) {
-          emitUpdates(it.starts.keys(), true);   // guaranteed trailing emit: peers end exactly in sync
+          const changes = [];
+          for (const [id, start] of it.starts) {
+            const s = strokesRef.current.get(id);
+            if (!s) continue;
+            const to = { x: s.x ?? 0, y: s.y ?? 0, scaleX: s.scaleX ?? 1, scaleY: s.scaleY ?? 1 };
+            const from = { x: start.x, y: start.y, scaleX: to.scaleX, scaleY: to.scaleY }; // drag never changes scale
+            if (to.x !== from.x || to.y !== from.y) changes.push({ id, from, to });
+          }
+          if (changes.length) {
+            undoStackRef.current.push({ type: 'transform', changes });
+            redoStackRef.current = [];
+          }
+          emitUpdates(it.starts.keys(), true);
         } else if (it.collapseTo) {
           setSelection(new Set([it.collapseTo]));
         }
@@ -1000,7 +1307,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     };
 
     strokesRef.current.set(finalStroke.id, finalStroke);
-    undoStackRef.current.push(finalStroke.id);
+    undoStackRef.current.push({ type: 'draw', id: finalStroke.id });
     redoStackRef.current = []; // a new stroke discards redo history
     socket.emit('stroke:end', finalStroke);
     scheduleRedraw();
