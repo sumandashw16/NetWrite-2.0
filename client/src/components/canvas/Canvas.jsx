@@ -533,7 +533,6 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
           ctx.stroke();
         }
         ctx.restore();
-
         // Rotate handle: small circle above the box, with a connecting line
         const [rhx, rhy] = getRotateHandlePos(bounds, scale);
         const topCenterX = (bounds.minX + bounds.maxX) / 2;
@@ -552,6 +551,17 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
         ctx.fill();
         ctx.stroke();
         ctx.restore();
+
+        // Degree readout while rotating
+        const rotIt = interactionRef.current;
+        if (rotIt?.type === 'rotate') {
+          ctx.save();
+          ctx.fillStyle = SELECTION_COLOR;
+          ctx.font = `${12 / scale}px sans-serif`;
+          ctx.textAlign = 'center';
+          ctx.fillText(`${rotIt.degreesLabel}°`, rhx, rhy - 14 / scale);
+          ctx.restore();
+        }
       }
     }
 
@@ -1120,7 +1130,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
         const angle = Math.atan2(y - py, x - px);
         let delta = angle - it.startAngle;
         if (e.shiftKey) delta = Math.round(delta / ROTATE_SNAP_RAD) * ROTATE_SNAP_RAD;
-        
+        it.degreesLabel = Math.round((delta * 180) / Math.PI);
         const cos = Math.cos(delta), sin = Math.sin(delta);
         for (const [id, st] of it.starts) {
           const s = strokesRef.current.get(id);
