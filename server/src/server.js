@@ -5,11 +5,11 @@ import cors from 'cors';
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 import dns from 'dns';
-import registerDrawHandlers from './socket/drawHandler.js';
+import { attachYjs, docs } from './socket/yjsServer.js';
 import registerCursorHandlers from './socket/cursorHandler.js';
 import boardRoutes from './routes/boardRoutes.js';
 import authRoutes from './routes/authRoutes.js';
-import { loadRoom, activeRoomsData } from './socket/roomStore.js';
+
 
 // Resolve MongoDB Atlas SRV record lookup timeout on local/ISP DNS
 dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -48,32 +48,28 @@ app.use('/api/auth', authRoutes);
 if (process.env.NODE_ENV !== 'production') {
   app.get('/debug/rooms', (req, res) => {
     res.json({
-      roomsInRam: [...activeRoomsData].map(([roomId, strokes]) => ({
+      roomsInRam: [...docs].map(([roomId, doc]) => ({
         roomId,
-        strokes: strokes.length
+        strokes: doc.getMap('strokes').size,
+        connections: doc.conns.size
       }))
     });
   });
 }
 
 const server = http.createServer(app);
+attachYjs(server);
 const io = new Server(server, {
   cors: { origin: "http://localhost:5173", methods: ["GET", "POST"] }
 });
 
 io.on('connection', (socket) => {
-  socket.on('join-room', async (roomId) => {
+  // Socket.IO now only carries live cursors
+  socket.on('join-room', (roomId) => {
     socket.data.roomId = roomId;
     socket.join(roomId);
-    try {
-      const strokes = await loadRoom(roomId);
-      socket.emit('canvas-catch-up', strokes); // only to this user
-    } catch (err) {
-      console.error(`Failed to load room ${roomId}:`, err);
-    }
   });
 
-  registerDrawHandlers(io, socket);
   registerCursorHandlers(io, socket);
 
   socket.on('disconnect', () => {

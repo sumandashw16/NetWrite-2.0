@@ -19,7 +19,7 @@ const strokeSchema = new mongoose.Schema(
     y: { type: Number, default: 0 },
     scaleX: { type: Number, default: 1 },
     scaleY: { type: Number, default: 1 },
-    rotation: { type: Number, default: 0 }  // radians
+    rotation: { type: Number, default: 0 },  // radians
   },
   { _id: false }
 );
@@ -34,7 +34,8 @@ const boardSchema = new mongoose.Schema(
     strokes: {
       type: [strokeSchema],
       default: []
-    }
+    },
+    ydocState: { type: Buffer }, // Yjs binary state (source of truth now)
   },
   { timestamps: true }
 );

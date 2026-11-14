@@ -1,6 +1,8 @@
 import { useRef, useEffect, useState, forwardRef, useImperativeHandle, useContext } from 'react';
 import { socket } from '../../services/socket';
 import { AuthContext } from '../../context/AuthContext';
+import * as Y from 'yjs';
+import { WebsocketProvider } from 'y-websocket';
 
 const MIN_POINT_DISTANCE = 1;     // 1px radial prefilter
 const PREVIEW_INTERVAL_MS = 40;   // throttle for stroke:preview
@@ -22,7 +24,41 @@ const MIN_GROUP_SIZE_PX = 12;     // selection box can't be resized smaller than
 const ROTATE_HANDLE_OFFSET_PX = 24; // distance above the box, screen px
 const ROTATE_HANDLE_RADIUS_PX = 7;  // rotate handle hit/draw radius, screen px
 const ROTATE_SNAP_RAD = Math.PI / 12; // 15°, used when Shift is held
+const YJS_URL = 'ws://localhost:5000/yjs';
+const STROKE_FIELDS = ['id', 'userId', 'color', 'width', 'points', 'ts', 'x', 'y', 'scaleX', 'scaleY', 'rotation'];
 
+const num = (v, d) => (Number.isFinite(v) ? v : d);
+const scaleOk = (v) => (Number.isFinite(v) && Math.abs(v) >= 0.01 && Math.abs(v) <= 100 ? v : 1);
+const validPoints = new WeakSet();
+function pointsOk(p) {
+  if (!Array.isArray(p)) return false;
+  if (validPoints.has(p)) return true;
+  if (p.length % 2 === 0 && p.length <= 100000 && p.every(Number.isFinite)) { validPoints.add(p); return true; }
+  return false;
+}
+
+// Y.Map -> the plain object shape the renderer already understands.
+// ys.get('points') returns the SAME array each time, so the boundsCache WeakMap keeps working.
+function toPlain(ys) {
+  const points = ys.get('points');
+  if (!ys.get('id') || !pointsOk(points)) return null;
+  return {
+    id: ys.get('id'),
+    userId: ys.get('userId'),
+    color: ys.get('color'),
+    width: num(ys.get('width'), 1),
+    points,
+    ts: num(ys.get('ts'), 0),
+    x: num(ys.get('x'), 0),
+    y: num(ys.get('y'), 0),
+    scaleX: scaleOk(ys.get('scaleX')),
+    scaleY: scaleOk(ys.get('scaleY')),
+    rotation: num(ys.get('rotation'), 0)
+  };
+}
+
+// Same order on every peer: timestamp, then id as a tiebreak
+const byOrder = (a, b) => a.ts - b.ts || (a.id < b.id ? -1 : 1);
 // Per-handle sign for (pointer - anchor) along each axis, so the correct side always grows
 // and dragging past the anchor clamps instead of flipping/regrowing.
 const HANDLE_SIGNS = { nw: [-1, -1], ne: [1, -1], se: [1, 1], sw: [-1, 1] };
@@ -463,7 +499,9 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   const activeToolRef = useRef('select');
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const selectedIdsRef = useRef(new Set());
-
+  const ydocRef = useRef(null);
+  const yStrokesRef = useRef(null);
+  const providerRef = useRef(null);
   // Active drag / scale / rotate / marquee. Mutated on every pointer move, so a ref.
   //   { type: 'drag',   startWorld, startClient, starts: Map(id -> {x,y}), moved, collapseTo }
   //   { type: 'scale',  handle, anchor: [x,y], startBounds, starts: Map(id -> {x,y,scaleX,scaleY,centerX,centerY}) }
@@ -636,20 +674,32 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     scheduleRedraw();
   };
 
-  // Send absolute x/y/scaleX/scaleY/rotation for the given ids as one batched message
-  const emitUpdates = (ids, final) => {
-    const updates = [];
-    for (const id of ids) {
-      const s = strokesRef.current.get(id);
-      if (!s) continue;
-      updates.push({
-        id,
-        x: s.x ?? 0, y: s.y ?? 0,
-        scaleX: s.scaleX ?? 1, scaleY: s.scaleY ?? 1,
-        rotation: s.rotation ?? 0
-      });
-    }
-    if (updates.length) socket.emit('stroke:update', { updates, final });
+  // All writes go to Yjs. The observer updates the strokesRef mirror and redraws.
+  const addStroke = (s) => {
+    const ydoc = ydocRef.current;
+    if (!ydoc) return;
+    ydoc.transact(() => {
+      const m = new Y.Map();
+      for (const k of STROKE_FIELDS) if (s[k] !== undefined) m.set(k, s[k]);
+      yStrokesRef.current.set(s.id, m);
+    });
+  };
+
+  const removeStroke = (id) => {
+    ydocRef.current?.transact(() => yStrokesRef.current.delete(id));
+  };
+
+  // patches: [{ id, x?, y?, scaleX?, scaleY?, rotation? }]. Writes only the fields that changed.
+  const patchStroke = (patches) => {
+    const ydoc = ydocRef.current;
+    if (!ydoc) return;
+    ydoc.transact(() => {
+      for (const { id, ...fields } of patches) {
+        const ys = yStrokesRef.current.get(id);
+        if (!ys) continue; // erased by someone in the meantime
+        for (const [k, v] of Object.entries(fields)) if (ys.get(k) !== v) ys.set(k, v);
+      }
+    });
   };
 
   // Delete every stroke under (wx, wy). Loops because strokes can overlap.
@@ -658,8 +708,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     let erased = false;
     let hit;
     while ((hit = hitTestStrokes(strokesRef.current, wx, wy, tolWorld))) {
-      strokesRef.current.delete(hit.id);
-      socket.emit('stroke:delete', { roomId, id: hit.id });
+      strokesRef.current.delete(hit.id); // keeps the loop terminating even before Yjs echoes back
+      removeStroke(hit.id);
       erased = true;
     }
     if (erased) {
@@ -668,25 +718,14 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     }
   };
 
-  // Set x/y/scaleX/scaleY/rotation on existing strokes from a transform entry
-  // ('from' = undo, 'to' = redo), then sync peers. Returns false if nothing applied
-  // (e.g. every stroke in the entry was erased since).
   const applyTransform = (changes, key) => {
-    const ids = [];
+    const patches = [];
     for (const c of changes) {
-      const s = strokesRef.current.get(c.id);
-      if (!s) continue;
-      const v = c[key];
-      s.x = v.x;
-      s.y = v.y;
-      if (v.scaleX !== undefined) s.scaleX = v.scaleX;
-      if (v.scaleY !== undefined) s.scaleY = v.scaleY;
-      if (v.rotation !== undefined) s.rotation = v.rotation;
-      ids.push(c.id);
+      if (!strokesRef.current.has(c.id)) continue;
+      patches.push({ id: c.id, ...c[key] }); // from/to already use the field names
     }
-    if (!ids.length) return false;
-    emitUpdates(ids, true);
-    scheduleRedraw();
+    if (!patches.length) return false;
+    patchStroke(patches);
     return true;
   };
 
@@ -696,12 +735,9 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
 
       if (entry.type === 'draw') {
         const stroke = strokesRef.current.get(entry.id);
-        if (!stroke) continue;                         // already gone, try the next entry
-        strokesRef.current.delete(entry.id);
+        if (!stroke) continue;
         redoStackRef.current.push({ type: 'draw', stroke });
-        socket.emit('stroke:delete', { id: entry.id });
-        pruneSelection();
-        scheduleRedraw();
+        removeStroke(entry.id);
         return;
       }
 
@@ -718,10 +754,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       const entry = redoStackRef.current.pop();
 
       if (entry.type === 'draw') {
-        strokesRef.current.set(entry.stroke.id, entry.stroke);
+        addStroke(entry.stroke); // keeps its original ts, so it returns to its original layer
         undoStackRef.current.push({ type: 'draw', id: entry.stroke.id });
-        socket.emit('stroke:end', entry.stroke); // server and peers already handle this (transform included)
-        scheduleRedraw();
         return;
       }
 
@@ -766,7 +800,13 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       cameraChanged();
     },
     clearBoard: () => {
-      socket.emit('clear-board');
+      const ydoc = ydocRef.current;
+      if (!ydoc) return;
+      ydoc.transact(() => {
+        yStrokesRef.current.clear();
+        const meta = ydoc.getMap('meta');
+        meta.set('clearEpoch', (meta.get('clearEpoch') ?? 0) + 1); // tells every client to reset undo/redo
+      });
     },
     saveToDatabase: async () => {
       try {
@@ -787,90 +827,85 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
 
+    // ---- Yjs document + provider (one isolated doc per roomId) ----
+    const ydoc = new Y.Doc();
+    const yStrokes = ydoc.getMap('strokes');
+    const yMeta = ydoc.getMap('meta');
+    const provider = new WebsocketProvider(YJS_URL, roomId, ydoc); // connects to ws://.../yjs/<roomId>
+    const awareness = provider.awareness;
+    ydocRef.current = ydoc;
+    yStrokesRef.current = yStrokes;
+    providerRef.current = provider;
+
     strokesRef.current = new Map();
     peerPreviewsRef.current = new Map();
     currentStrokeRef.current = null;
     interactionRef.current = null;
-    // undoStackRef.current = [];
-    // redoStackRef.current = [];
 
-    // Full board from the server when joining (strokes include x/y/scale/rotation)
-    const handleCatchUp = (strokes) => {
-      strokesRef.current = new Map(strokes.map((s) => [s.id, s]));
-      peerPreviewsRef.current.clear();
-      pruneSelection();
-      scheduleRedraw();
-    };
-
-    // A peer's in-progress stroke: overwrite by id with the latest full points array
-    const handlePreview = (data) => {
-      if (strokesRef.current.has(data.id)) return;
-      peerPreviewsRef.current.set(data.id, data);
-      scheduleRedraw();
-    };
-
-    // A peer's finalized stroke replaces their preview
-    const handleEnd = (stroke) => {
-      peerPreviewsRef.current.delete(stroke.id);
-      strokesRef.current.set(stroke.id, stroke);
-      scheduleRedraw();
-    };
-
-    // A peer moved/scaled/rotated some strokes: absolute values, so just assign
-    const handleUpdate = ({ updates }) => {
-      if (!Array.isArray(updates)) return;
-      const interacting = interactionRef.current?.starts ?? null; // my own drag/scale/rotate in progress
-      for (const u of updates) {
-        if (interacting?.has(u.id)) continue; // I'm transforming it right now; my local state wins, no jitter
-        const stroke = strokesRef.current.get(u.id);
-        if (!stroke) continue;
-        if (Number.isFinite(u.x)) stroke.x = u.x;
-        if (Number.isFinite(u.y)) stroke.y = u.y;
-        if (Number.isFinite(u.scaleX)) stroke.scaleX = u.scaleX;
-        if (Number.isFinite(u.scaleY)) stroke.scaleY = u.scaleY;
-        if (Number.isFinite(u.rotation)) stroke.rotation = u.rotation;
+    // Keep the strokesRef mirror in sync. Fires for local AND remote changes (and initial sync).
+    const onStrokesChange = (events) => {
+      const ids = new Set();
+      for (const ev of events) {
+        if (ev.target === yStrokes) ev.keysChanged.forEach((k) => ids.add(k));
+        else ids.add(ev.path[0]); // a field inside one stroke changed
       }
-      scheduleRedraw();
-    };
 
-    const handleRemove = ({ id }) => {
-      strokesRef.current.delete(id);
-      peerPreviewsRef.current.delete(id);
+      let added = false;
+      const map = strokesRef.current;
+      for (const id of ids) {
+        const ys = yStrokes.get(id);
+        const plain = ys ? toPlain(ys) : null;
+        if (plain) {
+          if (!map.has(id)) { added = true; peerPreviewsRef.current.delete(id); }
+          map.set(id, plain);
+        } else {
+          map.delete(id);
+        }
+      }
+      if (added) {
+        strokesRef.current = new Map([...map.values()].sort(byOrder).map((s) => [s.id, s]));
+      }
       pruneSelection();
       scheduleRedraw();
     };
+    yStrokes.observeDeep(onStrokesChange);
 
-    const handleClear = () => {
-      strokesRef.current.clear();
-      peerPreviewsRef.current.clear();
+    // Board cleared by anyone: undo/redo history refers to strokes that no longer exist
+    const onMetaChange = () => {
       undoStackRef.current = [];
       redoStackRef.current = [];
       interactionRef.current = null;
-      pruneSelection();
       scheduleRedraw();
     };
+    yMeta.observe(onMetaChange);
 
-    // Drop previews left behind by a peer who disconnected mid-stroke
-    const handlePeerLeft = (socketId) => {
-      for (const [id, preview] of peerPreviewsRef.current) {
-        if (preview.socketId === socketId) peerPreviewsRef.current.delete(id);
-      }
+    // Peers' in-progress strokes travel over awareness (ephemeral, never stored in the doc)
+    const onAwareness = () => {
+      const next = new Map();
+      awareness.getStates().forEach((state, clientId) => {
+        if (clientId === ydoc.clientID) return;
+        const p = state.preview;
+        if (p?.id && pointsOk(p.points) && !strokesRef.current.has(p.id)) next.set(p.id, p);
+      });
+      peerPreviewsRef.current = next;
       scheduleRedraw();
     };
+    awareness.on('change', onAwareness);
 
+    // ---- camera + keyboard (unchanged) ----
     const onWheel = (e) => {
-      e.preventDefault(); // only works with { passive: false } below
+      e.preventDefault();
       const cam = cameraRef.current;
       const rect = canvas.getBoundingClientRect();
       const sx = e.clientX - rect.left;
       const sy = e.clientY - rect.top;
 
-      const [wx, wy] = screenToWorld(sx, sy);                 // world point under the cursor
-      const k = e.ctrlKey ? 0.01 : 0.001;                      // trackpad pinch vs mouse wheel
+      const [wx, wy] = screenToWorld(sx, sy);
+      const k = e.ctrlKey ? 0.01 : 0.001;
       const next = Math.min(MAX_SCALE, Math.max(MIN_SCALE, cam.scale * Math.exp(-e.deltaY * k)));
 
       cam.scale = next;
-      cam.x = sx - wx * next;                                  // keep that world point under the cursor
+      cam.x = sx - wx * next;
       cam.y = sy - wy * next;
       cameraChanged();
     };
@@ -891,26 +926,25 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('blur', onBlur);
-    // Register listeners BEFORE joining so the catch-up can't be missed
-    socket.on('canvas-catch-up', handleCatchUp);
-    socket.on('stroke:preview', handlePreview);
-    socket.on('stroke:end', handleEnd);
-    socket.on('stroke:update', handleUpdate);
-    socket.on('clear-board', handleClear);
-    socket.on('peer-left', handlePeerLeft);
-    socket.on('stroke:delete', handleRemove);
-    socket.emit('join-room', roomId);
+
+    const join = () => socket.emit('join-room', roomId);
+    socket.on('connect', join);
+    if (socket.connected) join();
 
     redrawAll();
 
     return () => {
-      socket.off('canvas-catch-up', handleCatchUp);
-      socket.off('stroke:preview', handlePreview);
-      socket.off('stroke:end', handleEnd);
-      socket.off('stroke:update', handleUpdate);
-      socket.off('clear-board', handleClear);
-      socket.off('peer-left', handlePeerLeft);
-      socket.off('stroke:delete', handleRemove);
+      socket.off('connect', join);
+      yStrokes.unobserveDeep(onStrokesChange);
+      yMeta.unobserve(onMetaChange);
+      awareness.off('change', onAwareness);
+      awareness.setLocalState(null);
+      provider.destroy();
+      ydoc.destroy();
+      ydocRef.current = null;
+      yStrokesRef.current = null;
+      providerRef.current = null;
+
       canvas.removeEventListener('wheel', onWheel);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
@@ -1106,25 +1140,21 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
         let gsy = newH / startH;
         if (e.shiftKey) { const g = Math.max(gsx, gsy); gsx = gsy = g; } // uniform scale
 
+        const patches = [];
         for (const [id, st] of it.starts) {
-          const s = strokesRef.current.get(id);
-          if (!s) continue;
           const worldCenterX0 = st.centerX + st.x;
           const worldCenterY0 = st.centerY + st.y;
           const newCenterX = ax + (worldCenterX0 - ax) * gsx;
           const newCenterY = ay + (worldCenterY0 - ay) * gsy;
-          s.x = round1(newCenterX - st.centerX);
-          s.y = round1(newCenterY - st.centerY);
-          s.scaleX = round4(clamp(st.scaleX * gsx, MIN_OBJECT_SCALE, MAX_OBJECT_SCALE));
-          s.scaleY = round4(clamp(st.scaleY * gsy, MIN_OBJECT_SCALE, MAX_OBJECT_SCALE));
+          patches.push({
+            id,
+            x: round1(newCenterX - st.centerX),
+            y: round1(newCenterY - st.centerY),
+            scaleX: round4(clamp(st.scaleX * gsx, MIN_OBJECT_SCALE, MAX_OBJECT_SCALE)),
+            scaleY: round4(clamp(st.scaleY * gsy, MIN_OBJECT_SCALE, MAX_OBJECT_SCALE))
+          });
         }
-
-        const now = performance.now();
-        if (now - lastUpdateEmitRef.current >= UPDATE_INTERVAL_MS) {
-          lastUpdateEmitRef.current = now;
-          emitUpdates(it.starts.keys(), false);
-        }
-        scheduleRedraw();
+        patchStroke(patches);
       } else if (it.type === 'rotate') {
         const [px, py] = it.pivot;
         const angle = Math.atan2(y - py, x - px);
@@ -1132,25 +1162,22 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
         if (e.shiftKey) delta = Math.round(delta / ROTATE_SNAP_RAD) * ROTATE_SNAP_RAD;
         it.degreesLabel = Math.round((delta * 180) / Math.PI);
         const cos = Math.cos(delta), sin = Math.sin(delta);
+        const patches = [];
         for (const [id, st] of it.starts) {
-          const s = strokesRef.current.get(id);
-          if (!s) continue;
           const worldCenterX0 = st.centerX + st.x;
           const worldCenterY0 = st.centerY + st.y;
           const dx = worldCenterX0 - px;
           const dy = worldCenterY0 - py;
           const newCenterX = px + dx * cos - dy * sin;
           const newCenterY = py + dx * sin + dy * cos;
-          s.x = round1(newCenterX - st.centerX);
-          s.y = round1(newCenterY - st.centerY);
-          s.rotation = round4(st.rotation + delta);
+          patches.push({
+            id,
+            x: round1(newCenterX - st.centerX),
+            y: round1(newCenterY - st.centerY),
+            rotation: round4(st.rotation + delta)
+          });
         }
-
-        const now = performance.now();
-        if (now - lastUpdateEmitRef.current >= UPDATE_INTERVAL_MS) {
-          lastUpdateEmitRef.current = now;
-          emitUpdates(it.starts.keys(), false);
-        }
+        patchStroke(patches);
         scheduleRedraw();
       } else if (it.type === 'drag') {
         if (!it.moved) {
@@ -1163,18 +1190,11 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
 
         const ddx = x - it.startWorld[0];
         const ddy = y - it.startWorld[1];
+        const patches = [];
         for (const [id, start] of it.starts) {
-          const s = strokesRef.current.get(id);
-          if (!s) continue;
-          s.x = round1(start.x + ddx);
-          s.y = round1(start.y + ddy);
+          patches.push({ id, x: round1(start.x + ddx), y: round1(start.y + ddy) });
         }
-
-        const now = performance.now();
-        if (now - lastUpdateEmitRef.current >= UPDATE_INTERVAL_MS) {
-          lastUpdateEmitRef.current = now;
-          emitUpdates(it.starts.keys(), false);
-        }
+        patchStroke(patches);
         scheduleRedraw();
       } else if (it.type === 'marquee') {
         it.current = [x, y];
@@ -1212,10 +1232,9 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     const now = performance.now();
     if (now - lastPreviewEmitRef.current >= PREVIEW_INTERVAL_MS) {
       lastPreviewEmitRef.current = now;
-      socket.emit('stroke:preview', {
+      providerRef.current?.awareness.setLocalStateField('preview', {
         id: stroke.id,
         userId: stroke.userId,
-        socketId: socket.id,
         color: stroke.color,
         width: stroke.width,
         points: pts.slice()
@@ -1258,7 +1277,6 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
           undoStackRef.current.push({ type: 'transform', changes });
           redoStackRef.current = []; // a new action discards redo history
         }
-        emitUpdates(it.starts.keys(), true); // guaranteed trailing emit: peers end exactly in sync
       } else if (it.type === 'rotate') {
         const changes = [];
         for (const [id, st] of it.starts) {
@@ -1274,7 +1292,6 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
           undoStackRef.current.push({ type: 'transform', changes });
           redoStackRef.current = [];
         }
-        emitUpdates(it.starts.keys(), true);
       } else if (it.type === 'drag') {
         if (it.moved) {
           const changes = [];
@@ -1289,7 +1306,6 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
             undoStackRef.current.push({ type: 'transform', changes });
             redoStackRef.current = [];
           }
-          emitUpdates(it.starts.keys(), true);
         } else if (it.collapseTo) {
           setSelection(new Set([it.collapseTo]));
         }
@@ -1313,13 +1329,14 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     // Douglas-Peucker, then round to 1 decimal place
     const finalStroke = {
       ...stroke,
+      ts: Date.now(),
       points: simplify(stroke.points, SIMPLIFY_EPSILON / cameraRef.current.scale).map(round1)
     };
 
-    strokesRef.current.set(finalStroke.id, finalStroke);
+    addStroke(finalStroke); // the observer puts it in strokesRef and redraws
+    providerRef.current?.awareness.setLocalStateField('preview', null);
     undoStackRef.current.push({ type: 'draw', id: finalStroke.id });
     redoStackRef.current = []; // a new stroke discards redo history
-    socket.emit('stroke:end', finalStroke);
     scheduleRedraw();
   };
 
