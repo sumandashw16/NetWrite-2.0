@@ -488,8 +488,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   const strokesRef = useRef(new Map());        // finalized strokes: id -> stroke
   const currentStrokeRef = useRef(null);       // my in-progress stroke
   const peerPreviewsRef = useRef(new Map());   // others' in-progress strokes: id -> preview
-  const undoStackRef = useRef([]);             // entries: { type:'draw', id } | { type:'transform', changes }
-  const redoStackRef = useRef([]);             // entries: { type:'draw', stroke } | { type:'transform', changes }
+  const undoManagerRef = useRef(null);
   const lastPreviewEmitRef = useRef(0);
   const lastUpdateEmitRef = useRef(0);
   const rafRef = useRef(null);
@@ -719,54 +718,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     }
   };
 
-  const applyTransform = (changes, key) => {
-    const patches = [];
-    for (const c of changes) {
-      if (!strokesRef.current.has(c.id)) continue;
-      patches.push({ id: c.id, ...c[key] }); // from/to already use the field names
-    }
-    if (!patches.length) return false;
-    patchStroke(patches);
-    return true;
-  };
-
-  const undo = () => {
-    while (undoStackRef.current.length) {
-      const entry = undoStackRef.current.pop();
-
-      if (entry.type === 'draw') {
-        const stroke = strokesRef.current.get(entry.id);
-        if (!stroke) continue;
-        redoStackRef.current.push({ type: 'draw', stroke });
-        removeStroke(entry.id);
-        return;
-      }
-
-      if (entry.type === 'transform') {
-        if (!applyTransform(entry.changes, 'from')) continue;
-        redoStackRef.current.push(entry);
-        return;
-      }
-    }
-  };
-
-  const redo = () => {
-    while (redoStackRef.current.length) {
-      const entry = redoStackRef.current.pop();
-
-      if (entry.type === 'draw') {
-        addStroke(entry.stroke); // keeps its original ts, so it returns to its original layer
-        undoStackRef.current.push({ type: 'draw', id: entry.stroke.id });
-        return;
-      }
-
-      if (entry.type === 'transform') {
-        if (!applyTransform(entry.changes, 'to')) continue;
-        undoStackRef.current.push(entry);
-        return;
-      }
-    }
-  };
+  const undo = () => { undoManagerRef.current?.undo(); };
+  const redo = () => { undoManagerRef.current?.redo(); };
 
   useEffect(() => {
     const onKey = (e) => {
@@ -871,15 +824,19 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     };
     yStrokes.observeDeep(onStrokesChange);
 
-    // Board cleared by anyone: undo/redo history refers to strokes that no longer exist
+    // Board cleared by anyone: wipe undo history so nobody can resurrect strokes that were deleted for everyone
     const onMetaChange = () => {
-      undoStackRef.current = [];
-      redoStackRef.current = [];
       interactionRef.current = null;
+      // microtask: lets the UndoManager finish recording the clear transaction first, then wipe it
+      queueMicrotask(() => undoManagerRef.current?.clear());
       scheduleRedraw();
     };
     yMeta.observe(onMetaChange);
-
+    // Undo/redo is per user: only changes made by THIS client are tracked (remote updates have a different origin)
+    const undoManager = new Y.UndoManager(yStrokes, {
+      captureTimeout: 1e9 // one gesture = one step. We end each gesture ourselves with stopCapturing()
+    });
+    undoManagerRef.current = undoManager;
     // Peers' in-progress strokes travel over awareness (ephemeral, never stored in the doc)
     const onAwareness = () => {
       const next = new Map();
@@ -952,6 +909,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       window.removeEventListener('blur', onBlur);
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
+      undoManager.destroy();
+      undoManagerRef.current = null;
     };
   }, [roomId]);
 
@@ -973,6 +932,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
 
     // ---- Select tool ----
     if (activeToolRef.current === 'select') {
+      undoManagerRef.current?.stopCapturing();
       const selected = selectedIdsRef.current;
 
       // Handles take priority over everything else when a selection exists
@@ -1075,6 +1035,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
 
     // ---- Eraser tool: destroys objects, never creates strokes ----
     if (activeToolRef.current === 'eraser') {
+      undoManagerRef.current?.stopCapturing();
       eraserRef.current = [wx, wy];
       eraseAt(wx, wy);
       return;
@@ -1266,53 +1227,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       interactionRef.current = null;
       canvasRef.current.style.cursor = spaceRef.current ? 'grab' : '';
 
-      if (it.type === 'scale') {
-        const changes = [];
-        for (const [id, st] of it.starts) {
-          const s = strokesRef.current.get(id);
-          if (!s) continue;
-          const from = { x: st.x, y: st.y, scaleX: st.scaleX, scaleY: st.scaleY };
-          const to = { x: s.x ?? 0, y: s.y ?? 0, scaleX: s.scaleX ?? 1, scaleY: s.scaleY ?? 1 };
-          if (to.x !== from.x || to.y !== from.y || to.scaleX !== from.scaleX || to.scaleY !== from.scaleY) {
-            changes.push({ id, from, to });
-          }
-        }
-        if (changes.length) {
-          undoStackRef.current.push({ type: 'transform', changes });
-          redoStackRef.current = []; // a new action discards redo history
-        }
-      } else if (it.type === 'rotate') {
-        const changes = [];
-        for (const [id, st] of it.starts) {
-          const s = strokesRef.current.get(id);
-          if (!s) continue;
-          const from = { x: st.x, y: st.y, rotation: st.rotation };
-          const to = { x: s.x ?? 0, y: s.y ?? 0, rotation: s.rotation ?? 0 };
-          if (to.x !== from.x || to.y !== from.y || to.rotation !== from.rotation) {
-            changes.push({ id, from, to });
-          }
-        }
-        if (changes.length) {
-          undoStackRef.current.push({ type: 'transform', changes });
-          redoStackRef.current = [];
-        }
-      } else if (it.type === 'drag') {
-        if (it.moved) {
-          const changes = [];
-          for (const [id, start] of it.starts) {
-            const s = strokesRef.current.get(id);
-            if (!s) continue;
-            const to = { x: s.x ?? 0, y: s.y ?? 0, scaleX: s.scaleX ?? 1, scaleY: s.scaleY ?? 1 };
-            const from = { x: start.x, y: start.y, scaleX: to.scaleX, scaleY: to.scaleY }; // drag never changes scale
-            if (to.x !== from.x || to.y !== from.y) changes.push({ id, from, to });
-          }
-          if (changes.length) {
-            undoStackRef.current.push({ type: 'transform', changes });
-            redoStackRef.current = [];
-          }
-        } else if (it.collapseTo) {
-          setSelection(new Set([it.collapseTo]));
-        }
+      if (it.type === 'drag') {
+        if (!it.moved && it.collapseTo) setSelection(new Set([it.collapseTo]));
       } else if (it.type === 'marquee') {
         const [x0, y0] = it.start;
         const [x1, y1] = it.current;
@@ -1324,23 +1240,23 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       scheduleRedraw();
       return;
     }
-
     // ---- Pen tool (unchanged) ----
+    
+        // ---- Pen tool (unchanged) ----
     const stroke = currentStrokeRef.current;
     if (!stroke) return;
     currentStrokeRef.current = null;
 
-    // Douglas-Peucker, then round to 1 decimal place
     const finalStroke = {
       ...stroke,
       ts: Date.now(),
+      x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0,
       points: simplify(stroke.points, SIMPLIFY_EPSILON / cameraRef.current.scale).map(round1)
     };
 
+    undoManagerRef.current?.stopCapturing();
     addStroke(finalStroke); // the observer puts it in strokesRef and redraws
     providerRef.current?.awareness.setLocalStateField('preview', null);
-    undoStackRef.current.push({ type: 'draw', id: finalStroke.id });
-    redoStackRef.current = []; // a new stroke discards redo history
     scheduleRedraw();
   };
 

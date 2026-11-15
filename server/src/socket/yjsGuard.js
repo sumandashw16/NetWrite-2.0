@@ -161,7 +161,7 @@ export function installDocGuard(ydoc) {
     }
   });
 
-  strokes.observeDeep((events, tr) => {
+    strokes.observeDeep((events, tr) => {
     if (typeof tr.origin?.terminate !== 'function') return; // only police remote clients, not our own writes
 
     const bad = new Set();
@@ -180,7 +180,10 @@ export function installDocGuard(ydoc) {
         const ys = strokes.get(k);
         if (!ys) continue;
         for (const f of ev.keysChanged) {
-          if (!MUTABLE_FIELDS.has(f) || !validField(f, ys.get(f))) bad.add(k);
+          if (!MUTABLE_FIELDS.has(f)) { bad.add(k); continue; }
+          const v = ys.get(f);
+          // undefined = the field was removed (an undo of the first-ever transform); clients fall back to the default
+          if (v !== undefined && !validField(f, v)) bad.add(k);
         }
       }
     }
