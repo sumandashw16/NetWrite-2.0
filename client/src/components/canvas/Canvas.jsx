@@ -470,6 +470,7 @@ function drawStroke(ctx, stroke) {
 // ---------------------------------------------------------------------------
 
 const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraChange, onToolChange, onSelectionChange }, ref) => {
+  const lastCursorEmitRef = useRef(0);
   const canvasRef = useRef(null);
   const { user } = useContext(AuthContext);
   const cameraRef = useRef({ x: 0, y: 0, scale: 1 }); // local to each user, never sent over the socket
@@ -1095,8 +1096,11 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     const { offsetX, offsetY } = e.nativeEvent;
     const [x, y] = screenToWorld(offsetX, offsetY);
 
-    // Cursor is sent in world coordinates; each viewer converts with their own camera
-    socket.emit('cursor-move', { roomId, x, y, username: user?.username || 'Unknown' });
+    const t = performance.now();
+    if (t - lastCursorEmitRef.current >= 33) { // ~30 cursor updates/s is plenty
+      lastCursorEmitRef.current = t;
+      socket.emit('cursor-move', { roomId, x, y, username: user?.username || 'Unknown' });
+    }
 
     if (panRef.current) {                          // panning: move the camera by the screen delta
       const cam = cameraRef.current;

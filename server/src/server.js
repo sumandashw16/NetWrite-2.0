@@ -9,7 +9,12 @@ import { attachYjs, docs } from './socket/yjsServer.js';
 import registerCursorHandlers from './socket/cursorHandler.js';
 import boardRoutes from './routes/boardRoutes.js';
 import authRoutes from './routes/authRoutes.js';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 
+// Last-resort nets: log instead of dying. In production, also run under pm2/systemd so a bad state restarts.
+process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason));
+process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
 
 // Resolve MongoDB Atlas SRV record lookup timeout on local/ISP DNS
 dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -26,9 +31,9 @@ dotenv.config();
 
 const app = express();
 
-// Increase JSON limit because arrays of strokes can get quite large
-app.use(cors());
-app.use(express.json({ limit: '50mb' })); 
+app.use(helmet());
+app.use(cors({ origin: 'http://localhost:5173' }));   // was open to every origin
+app.use(express.json({ limit: '100kb' }));            // was 50mb; POST /boards ignores the body now
 
 // Connect to MongoDB
 const mongoURI = process.env.MONGODB_URI || process.env.MONGO_URI;
@@ -42,6 +47,8 @@ if (!mongoURI) {
 }
 
 // API Routes
+app.use('/api', rateLimit({ windowMs: 60_000, limit: 120 }));
+app.use('/api/auth', rateLimit({ windowMs: 15 * 60_000, limit: 20 })); // brute-force protection for login
 app.use('/api/boards', boardRoutes);
 app.use('/api/auth', authRoutes);
 
@@ -60,12 +67,27 @@ if (process.env.NODE_ENV !== 'production') {
 const server = http.createServer(app);
 attachYjs(server);
 const io = new Server(server, {
+  maxHttpBufferSize: 10_000, // 10 KB: cursor events are tiny
   cors: { origin: "http://localhost:5173", methods: ["GET", "POST"] }
 });
 
+const ROOM_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
 io.on('connection', (socket) => {
-  // Socket.IO now only carries live cursors
+  // per-socket limit across ALL events: 60/s sustained, 120 burst
+  let tokens = 120, last = Date.now();
+  socket.use((_packet, next) => {
+    const now = Date.now();
+    tokens = Math.min(120, tokens + ((now - last) / 1000) * 60);
+    last = now;
+    if (tokens < 1) return socket.disconnect(true);
+    tokens -= 1;
+    next();
+  });
+
   socket.on('join-room', (roomId) => {
+    if (typeof roomId !== 'string' || !ROOM_ID.test(roomId)) return;
+    if (socket.data.roomId) socket.leave(socket.data.roomId);
     socket.data.roomId = roomId;
     socket.join(roomId);
   });
