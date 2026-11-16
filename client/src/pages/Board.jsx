@@ -18,6 +18,9 @@ export default function Board() {
       canvasRef.current.saveToDatabase();
     }
   };
+  const handleExport = () => {
+    canvasRef.current?.exportPNG();
+  };
 
   const handleClear = () => {
     if (window.confirm('Are you sure you want to clear the entire whiteboard for everyone?')) {
@@ -75,6 +78,13 @@ export default function Board() {
           style={{ padding: '4px 12px', background: '#3b82f6', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}
         >
           Save Board
+        </button>
+
+        <button 
+          onClick={handleExport} 
+          style={{ padding: '4px 12px', background: '#10b981', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}
+        >
+          Export PNG
         </button>
       </div>
 

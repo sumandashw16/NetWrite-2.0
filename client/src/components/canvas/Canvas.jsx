@@ -773,8 +773,42 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
         console.error('Error saving board:', error);
         alert('Failed to save board.');
       }
+    },
+    exportPNG: () => {
+    const strokes = [...strokesRef.current.values()];
+    if (!strokes.length) return alert('Nothing to export');
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const s of strokes) {
+      const b = getWorldBounds(s, (s.width ?? 1) / 2);
+      if (!b) continue;
+      minX = Math.min(minX, b.minX); minY = Math.min(minY, b.minY);
+      maxX = Math.max(maxX, b.maxX); maxY = Math.max(maxY, b.maxY);
     }
-  }));
+
+    const PAD = 20;
+    const w = Math.ceil(maxX - minX) + PAD * 2;
+    const h = Math.ceil(maxY - minY) + PAD * 2;
+
+    const off = document.createElement('canvas');
+    off.width = w;
+    off.height = h;
+    const ctx = off.getContext('2d');
+    ctx.fillStyle = '#fff';           // omit this line for a transparent background
+    ctx.fillRect(0, 0, w, h);
+    ctx.translate(-minX + PAD, -minY + PAD);
+    for (const s of strokes) drawStroke(ctx, s);
+
+    off.toBlob((blob) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `board-${roomId}.png`;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  }
+}));
 
   useEffect(() => {
     const canvas = canvasRef.current;
