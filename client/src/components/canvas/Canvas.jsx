@@ -30,7 +30,7 @@ const YJS_URL = 'ws://localhost:5000/yjs';
 const STROKE_FIELDS = [
   'id', 'userId', 'color', 'width', 'points', 'ts',
   'x', 'y', 'scaleX', 'scaleY', 'rotation',
-  'type', 'shapeType', 'iconName'
+  'type', 'shapeType', 'iconName','text', 'fontSize'
 ];
 
 const num = (v, d) => (Number.isFinite(v) ? v : d);
@@ -52,7 +52,8 @@ function toPlain(ys) {
   const iconName = ys.get('iconName') || null;
   if (type === 'shape' && !(shapeType && Object.hasOwn(SHAPES, shapeType))) return null;
   if (type === 'icon' && !/^[a-z0-9-]{1,40}$/.test(iconName ?? '')) return null;
-
+  const textVal = ys.get('text') ?? null;
+  if (type === 'text' && typeof textVal !== 'string') return null;
   return {
     id: ys.get('id'),
     userId: ys.get('userId'),
@@ -65,7 +66,9 @@ function toPlain(ys) {
     scaleX: scaleOk(ys.get('scaleX')),
     scaleY: scaleOk(ys.get('scaleY')),
     rotation: num(ys.get('rotation'), 0),
-    type, shapeType, iconName
+    type, shapeType, iconName,
+    text: textVal,
+    fontSize: num(ys.get('fontSize'), 20),
   };
 }
 
@@ -99,6 +102,50 @@ function sqSegDist(px, py, ax, ay, bx, by) {
   const cx = ax + t * dx;
   const cy = ay + t * dy;
   return (px - cx) ** 2 + (py - cy) ** 2;
+}
+
+const measureCanvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
+const measureCtx = measureCanvas?.getContext('2d') ?? null;
+const textBoundsCache = new Map();
+
+function getTextBounds(stroke) {
+  const fontSize = stroke.fontSize || 20;
+  const key = `${fontSize}|${stroke.text}`;
+  let b = textBoundsCache.get(key);
+  if (b) return b;
+
+  const lines = (stroke.text || '').split('\n');
+  let maxW = 10;
+  if (measureCtx) {
+    measureCtx.font = `${fontSize}px Inter, system-ui, sans-serif`;
+    for (const line of lines) maxW = Math.max(maxW, measureCtx.measureText(line || ' ').width);
+  } else {
+    maxW = Math.max(maxW, ...lines.map((l) => l.length * fontSize * 0.6));
+  }
+  const lineHeight = fontSize * 1.3;
+  b = { minX: 0, minY: 0, maxX: maxW, maxY: lineHeight * Math.max(lines.length, 1) };
+  textBoundsCache.set(key, b);
+  if (textBoundsCache.size > 500) textBoundsCache.clear(); // cheap unbounded-growth guard
+  return b;
+}
+
+function drawText(ctx, stroke) {
+  const b = getLocalBounds(stroke);
+  const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
+  const t = getTransform(stroke);
+  const fontSize = stroke.fontSize || 20;
+  const lineHeight = fontSize * 1.3;
+
+  ctx.save();
+  ctx.translate(cx + t.x, cy + t.y);
+  ctx.rotate(t.rotation);
+  ctx.scale(t.scaleX, t.scaleY);
+  ctx.translate(-cx, -cy);
+  ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
+  ctx.fillStyle = stroke.color;
+  ctx.textBaseline = 'top';
+  (stroke.text || '').split('\n').forEach((line, i) => ctx.fillText(line, b.minX, b.minY + i * lineHeight));
+  ctx.restore();
 }
 
 // Iterative Douglas-Peucker on a flat [x0, y0, x1, y1, ...] array
@@ -157,7 +204,7 @@ const boundsCache = new WeakMap();
 function getLocalBounds(stroke) {
   if (stroke.type === 'shape') return SHAPE_BOUNDS;
   if (stroke.type === 'icon') return ICON_BOUNDS;
-
+  if (stroke.type === 'text') return getTextBounds(stroke);
   const pts = stroke.points;
   if (!pts || pts.length < 2) return null;
 
@@ -290,7 +337,7 @@ function hitTestStrokes(strokesMap, wx, wy, tolWorld) {
     if (!b) continue;
     if (wx < b.minX || wx > b.maxX || wy < b.minY || wy > b.maxY) continue;
 
-    if (s.type === 'icon') return s;   // solid glyph: the box is fine
+    if (s.type === 'icon' || s.type === 'text') return s;   // solid glyph: the box is fine
     const rSq = hitRadius * hitRadius;
 
     if (s.type === 'shape') {          // border only
@@ -377,7 +424,7 @@ function hitTestRotateHandle(f, wx, wy, cameraScale) {
 // (already world-space) polyline by a constant radius and joins with round caps.
 function getStrokeOutlineWorld(stroke, padPx, cameraScale) {
 
-  if (stroke.type === 'shape' || stroke.type === 'icon') {
+  if (stroke.type === 'shape' || stroke.type === 'icon' || stroke.type === 'text') {
     const pad = padPx / cameraScale;
     const b = getLocalBounds(stroke);
     if (!b) return null;
@@ -549,6 +596,7 @@ function drawIcon(ctx, stroke) {
 function drawStroke(ctx, stroke) {
   if (stroke.type === 'shape') return drawShape(ctx, stroke);
   if (stroke.type === 'icon') return drawIcon(ctx, stroke);
+  if (stroke.type === 'text') return drawText(ctx, stroke);
   if (!stroke.points || stroke.points.length === 0) return;
   const t = getTransform(stroke);
   drawRawStroke(ctx, isIdentity(t) ? stroke.points : transformPointsToWorld(stroke), stroke.color, stroke.width);
@@ -587,6 +635,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   const [activeTool, setActiveTool] = useState('select');
   const activeToolRef = useRef('select');
   const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [editingTextId, setEditingTextId] = useState(null);
   const selectedIdsRef = useRef(new Set());
   const ydocRef = useRef(null);
   const yStrokesRef = useRef(null);
@@ -838,6 +887,13 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       else if (k === 'p') setTool('pen');
       else if (k === 'e') setTool('eraser');
       else if (e.key === 'Escape' && selectedIdsRef.current.size) setSelection(new Set());
+      else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIdsRef.current.size) {
+        e.preventDefault();
+        const ids = [...selectedIdsRef.current];
+        undoManagerRef.current?.stopCapturing();
+        for (const id of ids) removeStroke(id);
+        setSelection(new Set());
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -855,6 +911,22 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     },
     addShape: (shapeType) => { if (Object.hasOwn(SHAPES, shapeType)) spawn({ type: 'shape', shapeType }); },
     addIcon: (iconName) => { if (Object.hasOwn(MDI_PATHS, iconName)) spawn({ type: 'icon', iconName, width: 1 }); },
+    addText: () => {
+      const canvas = canvasRef.current;
+      const [wx, wy] = screenToWorld(canvas.width / 2, canvas.height / 2);
+      const k = round4(clamp(1 / cameraRef.current.scale, MIN_OBJECT_SCALE, MAX_OBJECT_SCALE));
+      const id = crypto.randomUUID();
+      const s = {
+        id, userId, color, width: 1, points: [], ts: Date.now(),
+        x: round1(wx), y: round1(wy), scaleX: k, scaleY: k, rotation: 0,
+        type: 'text', text: 'Text', fontSize: 20
+      };
+      undoManagerRef.current?.stopCapturing();
+      addStroke(s);
+      setTool('select');
+      setSelection(new Set([id]));
+      setEditingTextId(id);
+    },
     clearBoard: () => {
       const ydoc = ydocRef.current;
       if (!ydoc) return;
@@ -910,7 +982,38 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
         a.click();
         URL.revokeObjectURL(url);
       });
-    }
+    },
+    deleteSelected: () => {
+      const ids = [...selectedIdsRef.current];
+      if (!ids.length) return;
+      undoManagerRef.current?.stopCapturing();
+      for (const id of ids) removeStroke(id);
+      setSelection(new Set());
+    },
+    duplicateSelected: () => {
+      const ids = [...selectedIdsRef.current];
+      if (!ids.length) return;
+      const OFFSET = 16;
+      const newIds = [];
+      undoManagerRef.current?.stopCapturing();
+      for (const id of ids) {
+        const s = strokesRef.current.get(id);
+        if (!s) continue;
+        const copy = { ...s, id: crypto.randomUUID(), ts: Date.now(), x: (s.x ?? 0) + OFFSET, y: (s.y ?? 0) + OFFSET };
+        addStroke(copy);
+        newIds.push(copy.id);
+      }
+      setSelection(new Set(newIds));
+    },
+    updateSelectedStyle: (fields) => {
+      const ids = [...selectedIdsRef.current];
+      if (!ids.length) return;
+      undoManagerRef.current?.stopCapturing();
+      patchStroke(ids.map((id) => ({ id, ...fields })));
+      scheduleRedraw();
+    },
+    getSelectedObjects: () => [...selectedIdsRef.current].map((id) => strokesRef.current.get(id)).filter(Boolean)
+    
   }));
 
   useEffect(() => {
@@ -1054,6 +1157,24 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   }, [roomId]);
 
   // ---- pointer handling -------------------------------------------------------------
+  const commitTextEdit = (id, value) => {
+  setEditingTextId(null);
+  const text = value.trim() || 'Text';
+  undoManagerRef.current?.stopCapturing();
+  patchStroke([{ id, text }]);
+  scheduleRedraw();
+};
+
+  const handleDoubleClick = (e) => {
+    if (activeToolRef.current !== 'select') return;
+    const { offsetX, offsetY } = e.nativeEvent;
+    const [wx, wy] = screenToWorld(offsetX, offsetY);
+    const hit = hitTestStrokes(strokesRef.current, wx, wy, HIT_TOLERANCE_PX / cameraRef.current.scale);
+    if (hit?.type === 'text') {
+      setSelection(new Set([hit.id]));
+      setEditingTextId(hit.id);
+    }
+  };
 
   const handlePointerDown = (e) => {
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -1355,6 +1476,24 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       scheduleRedraw();
       return;
     }
+    const commitTextEdit = (id, value) => {
+      setEditingTextId(null);
+      const text = value.trim() || 'Text';
+      undoManagerRef.current?.stopCapturing();
+      patchStroke([{ id, text }]);
+      scheduleRedraw();
+    };
+
+    const handleDoubleClick = (e) => {
+      if (activeToolRef.current !== 'select') return;
+      const { offsetX, offsetY } = e.nativeEvent;
+      const [wx, wy] = screenToWorld(offsetX, offsetY);
+      const hit = hitTestStrokes(strokesRef.current, wx, wy, HIT_TOLERANCE_PX / cameraRef.current.scale);
+      if (hit?.type === 'text') {
+        setSelection(new Set([hit.id]));
+        setEditingTextId(hit.id);
+      }
+    };
     // ---- Pen tool (unchanged) ----
 
     // ---- Pen tool (unchanged) ----
@@ -1374,20 +1513,50 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     providerRef.current?.awareness.setLocalStateField('preview', null);
     scheduleRedraw();
   };
-
   return (
-    <canvas
-      ref={canvasRef}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-      onPointerCancel={handlePointerUp}
-      onContextMenu={(e) => e.preventDefault()}
-      data-selected-count={selectedIds.size}
-      className={`bg-white touch-none ${activeTool === 'select' ? 'cursor-default' : activeTool === 'eraser' ? 'cursor-cell' : 'cursor-crosshair'
-        }`}
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onDoubleClick={handleDoubleClick}
+        onContextMenu={(e) => e.preventDefault()}
+        data-selected-count={selectedIds.size}
+        className={`touch-none ${activeTool === 'select' ? 'cursor-default' : activeTool === 'eraser' ? 'cursor-cell' : 'cursor-crosshair'}`}
+      />
+      {editingTextId && (() => {
+        const s = strokesRef.current.get(editingTextId);
+        if (!s) return null;
+        const wb = getWorldBounds(s);
+        const cam = cameraRef.current;
+        const screenX = wb.minX * cam.scale + cam.x;
+        const screenY = wb.minY * cam.scale + cam.y;
+        const screenW = Math.max((wb.maxX - wb.minX) * cam.scale, 60);
+        const screenH = Math.max((wb.maxY - wb.minY) * cam.scale, 30);
+        const screenFont = (s.fontSize || 20) * (s.scaleY ?? 1) * cam.scale;
+        return (
+          <textarea
+            autoFocus
+            defaultValue={s.text}
+            onBlur={(e) => commitTextEdit(editingTextId, e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.blur(); }
+              if (e.key === 'Escape') { e.target.value = s.text; e.target.blur(); }
+            }}
+            style={{
+              position: 'absolute', left: screenX, top: screenY, width: screenW, minHeight: screenH,
+              font: `${screenFont}px Inter, system-ui, sans-serif`, color: s.color,
+              border: '1px dashed #2563eb', background: 'rgba(255,255,255,0.9)', padding: 0,
+              resize: 'none', outline: 'none', lineHeight: 1.3, overflow: 'hidden', zIndex: 15
+            }}
+          />
+        );
+      })()}
+    </>
   );
+ 
 });
 
 export default Canvas;
