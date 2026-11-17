@@ -914,11 +914,10 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     addText: () => {
       const canvas = canvasRef.current;
       const [wx, wy] = screenToWorld(canvas.width / 2, canvas.height / 2);
-      const k = round4(clamp(1 / cameraRef.current.scale, MIN_OBJECT_SCALE, MAX_OBJECT_SCALE));
       const id = crypto.randomUUID();
       const s = {
         id, userId, color, width: 1, points: [], ts: Date.now(),
-        x: round1(wx), y: round1(wy), scaleX: k, scaleY: k, rotation: 0,
+        x: round1(wx), y: round1(wy), scaleX: 1, scaleY: 1, rotation: 0,
         type: 'text', text: 'Text', fontSize: 20
       };
       undoManagerRef.current?.stopCapturing();
