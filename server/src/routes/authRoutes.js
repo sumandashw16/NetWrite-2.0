@@ -2,7 +2,7 @@ import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
-
+import { signGuestToken } from '../middlewares/authMiddleware.js';
 const router = express.Router();
 
 // Register a new user
@@ -59,5 +59,5 @@ router.post('/login', async (req, res) => {
     res.status(500).json({ error: 'Server error during login' });
   }
 });
-
+router.post('/guest', (req, res) => res.json(signGuestToken()));
 export default router;

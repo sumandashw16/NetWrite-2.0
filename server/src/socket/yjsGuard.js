@@ -1,19 +1,25 @@
 import Y from './yjsShared.js';
 import { createRequire } from 'module';
+import { getRoom } from '../rooms/roomState.js';
+import { canWrite } from '../rooms/permissions.js';
 const require = createRequire(import.meta.url);
 const decoding = require('lib0/decoding'); // same CJS build family y-websocket uses
 // ---- Layers 1 + 2 ----
-export const MAX_MESSAGE_BYTES = 64 * 1024;
-const MSG_RATE = 200, MSG_BURST = 400;            // messages / second
-const BYTE_RATE = 512 * 1024, BYTE_BURST = 1024 * 1024; // bytes / second
+export const MAX_MESSAGE_BYTES = 64 * 1024;      // awareness and other messages
+export const MAX_SYNC_BYTES = 4 * 1024 * 1024;   // sync messages carry document state
+const MSG_RATE = 200, MSG_BURST = 400;
+const BYTE_RATE = 512 * 1024, BYTE_BURST = 4 * 1024 * 1024; // burst must fit one full sync
 
 // ---- Layer 3 ----
 const MAX_STROKES = 20_000;
 const MAX_POINT_VALUES = 20_000;                  // flat array length = 10k points
 const COORD_LIMIT = 1_000_000;
 const ALLOWED_ROOT_TYPES = new Set(['strokes', 'meta']);
-const MUTABLE_FIELDS = new Set(['x', 'y', 'scaleX', 'scaleY', 'rotation']);
 const ENFORCE_FRAME_CHECK = true;
+const SHAPE_TYPES = new Set(['rect', 'rounded', 'circle', 'triangle', 'diamond', 'pentagon', 'hexagon', 'star', 'arrow']);
+const FONT_FAMILY_KEYS = new Set(['sans', 'serif', 'mono', 'hand']);
+const ICON_NAME = /^[a-z0-9-]{1,40}$/;
+const MUTABLE_FIELDS = new Set(['x', 'y', 'scaleX', 'scaleY', 'rotation', 'color', 'width', 'text', 'fontSize','boxWidth', 'fontFamily', 'autoWidth']);  // color/width: recolor later
 // Repeat offenders get refused for 10 minutes (y-websocket clients auto-reconnect, so a bare kick is pointless)
 const strikes = new Map(); // ip -> { count, until, last }
 const STRIKE_WINDOW_MS = 60 * 60_000; // strikes expire after an hour
@@ -85,6 +91,21 @@ function frameError(data) {
     return err.message;
   }
 }
+// Close for a permission reason: no strike, no ban. 4403 tells the client to resync.
+const denyWrite = (ws) => {
+  if (ws.kicked) return;
+  ws.kicked = true;
+  ws.close(4403, 'write not permitted');
+};
+
+// Sync frame = [0, subtype, varuint len, ...update]. An empty update is 00 00.
+const isEmptySync = (b) => b.length === 5 && b[2] === 2 && b[3] === 0 && b[4] === 0;
+
+// Looked up on EVERY message. Nothing about permissions is cached on ws.
+const mayWrite = (ws) => {
+  const room = getRoom(ws.roomId);
+  return !!room && canWrite(room, ws.identityId);
+};
 // Call AFTER setupWSConnection: wraps its message listener so bad packets never reach it
 export function guardConnection(ws) {
   // An unhandled 'error' event on a ws socket throws and takes the whole process down
@@ -97,17 +118,27 @@ export function guardConnection(ws) {
 
   ws.on('message', (data, isBinary) => {
     if (ws.kicked) return;
-    const size = data.byteLength ?? data.length;
     if (!isBinary) return kick(ws, 'text frame');
-    if (size > MAX_MESSAGE_BYTES) return kick(ws, `message too large (${size} bytes)`);
+
+    const size = data.byteLength ?? data.length;
+    const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+    const limit = bytes[0] === 0 ? MAX_SYNC_BYTES : MAX_MESSAGE_BYTES; // byte 0 = message type; 0 = sync
+    if (size > limit) return kick(ws, `message too large (${size} bytes)`);
     if (!okMsg(1)) return kick(ws, 'message rate limit');
     if (!okBytes(size)) return kick(ws, 'bandwidth limit');
-    const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+
     const bad = frameError(bytes);
     if (bad) {
-        console.warn(`[guard] bad frame: ${bad} size=${size} head=${Buffer.from(bytes).subarray(0, 16).toString('hex')}`);
-        if (ENFORCE_FRAME_CHECK) return kick(ws, `malformed frame: ${bad}`);
+      console.warn(`[guard] bad frame: ${bad} size=${size} head=${Buffer.from(bytes).subarray(0, 16).toString('hex')}`);
+      if (ENFORCE_FRAME_CHECK) return kick(ws, `malformed frame: ${bad}`);
     }
+    // PRE-MERGE write gate. Subtype 0 = sync step 1 (a read request) is always fine.
+    // Subtypes 1 (step 2) and 2 (update) carry mutations.
+    if (bytes[0] === 0 && bytes[1] !== 0 && !mayWrite(ws)) {
+      if (isEmptySync(bytes)) return;   // a read-only client's normal "nothing to add" reply
+      return denyWrite(ws);             // real mutation: nothing reaches the doc
+    }
+
     activeConn = ws;
     try {
       for (const h of handlers) h.call(ws, data, isBinary);
@@ -129,11 +160,20 @@ function validField(k, v) {
     case 'userId': return typeof v === 'string' && v.length <= 128;
     case 'color': return typeof v === 'string' && /^#[0-9a-f]{3,8}$/i.test(v);
     case 'width': return Number.isFinite(v) && v > 0 && v <= 200;
+    case 'fontSize': return Number.isFinite(v) && v > 0 && v <= 500;
+    case 'boxWidth': return Number.isFinite(v) && v > 0 && v <= 4000;
+    case 'fontFamily': return typeof v === 'string' && FONT_FAMILY_KEYS.has(v);
     case 'ts': return Number.isFinite(v);
     case 'x': case 'y': return isNum(v);
     case 'scaleX': case 'scaleY': return scaleOk(v);
     case 'rotation': return Number.isFinite(v) && Math.abs(v) <= 1e4;
-    case 'points': return Array.isArray(v) && v.length >= 2 && v.length % 2 === 0 && v.length <= MAX_POINT_VALUES && v.every(isNum);
+    case 'points': return Array.isArray(v) && v.length % 2 === 0 && v.length <= MAX_POINT_VALUES && v.every(isNum);
+    case 'shapeType': return v === null || (typeof v === 'string' && SHAPE_TYPES.has(v));
+    case 'iconName': return v === null || (typeof v === 'string' && ICON_NAME.test(v));
+    case 'svgPath': return v === null || (typeof v === 'string' && v.length <= 50_000);
+    case 'type': return typeof v === 'string' && (v === 'path' || v === 'shape' || v === 'icon' || v === 'text');
+    case 'text': return typeof v === 'string' && v.length <= 10_000;
+    case 'autoWidth': return typeof v === 'boolean';
     default: return false; // unknown fields are not allowed
   }
 }
@@ -141,7 +181,22 @@ function validField(k, v) {
 function validStroke(key, ys) {
   if (!(ys instanceof Y.Map)) return false;
   const obj = ys.toJSON();
-  return obj.id === key && 'points' in obj && Object.entries(obj).every(([k, v]) => validField(k, v));
+  if (obj.id !== key) return false;
+  if (!Object.entries(obj).every(([k, v]) => validField(k, v))) return false;
+
+  const type = obj.type || 'path';
+  if (type === 'path') {
+    if (!Array.isArray(obj.points) || obj.points.length < 2) return false;
+  } else if (type === 'shape') {
+    if (!SHAPE_TYPES.has(obj.shapeType)) return false;
+  } else if (type === 'icon') {
+    if (typeof obj.iconName !== 'string' || !ICON_NAME.test(obj.iconName)) return false;
+  } else if (type === 'text') {
+  if (typeof obj.text !== 'string') return false;
+  } else {
+    return false;
+  }
+  return true;
 }
 
 // Must run synchronously when the doc is created, so no update can slip in before it

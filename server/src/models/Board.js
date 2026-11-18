@@ -1,5 +1,4 @@
 import mongoose from 'mongoose';
-
 const strokeSchema = new mongoose.Schema(
   {
     id: {
@@ -23,6 +22,16 @@ const strokeSchema = new mongoose.Schema(
   },
   { _id: false }
 );
+const memberSchema = new mongoose.Schema(
+  {
+    userId: { type: String, required: true },   // raw user id, no "u:" prefix. Guests are never stored.
+    username: String,
+    role: { type: String, enum: ['cohost', 'joiner'], default: 'joiner' },
+    canWrite: { type: Boolean, default: false },
+    grantedAt: { type: Number, default: 0 },    // co-host order for failover
+  },
+  { _id: false }
+);
 
 const boardSchema = new mongoose.Schema(
   {
@@ -36,8 +45,12 @@ const boardSchema = new mongoose.Schema(
       default: []
     },
     ydocState: { type: Buffer }, // Yjs binary state (source of truth now)
+    owner: { type: String, index: true },       // raw user id. Persisted boards are always user-owned.
+    ownerName: String,
+    isPrivate: { type: Boolean, default: false },
+    members: { type: [memberSchema], default: [] },
   },
   { timestamps: true }
 );
-
+boardSchema.index({ 'members.userId': 1 });
 export default mongoose.model('Board', boardSchema);

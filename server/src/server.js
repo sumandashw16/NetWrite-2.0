@@ -11,7 +11,9 @@ import boardRoutes from './routes/boardRoutes.js';
 import authRoutes from './routes/authRoutes.js';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-
+// imports
+import { socketAuth } from './middlewares/authMiddleware.js';
+import { registerRoomHandlers, initRoomBroadcasts } from './socket/roomHandler.js';
 // Last-resort nets: log instead of dying. In production, also run under pm2/systemd so a bad state restarts.
 process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason));
 process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
@@ -70,8 +72,9 @@ const io = new Server(server, {
   maxHttpBufferSize: 10_000, // 10 KB: cursor events are tiny
   cors: { origin: "http://localhost:5173", methods: ["GET", "POST"] }
 });
+io.use(socketAuth);
+initRoomBroadcasts(io);
 
-const ROOM_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 io.on('connection', (socket) => {
   // per-socket limit across ALL events: 60/s sustained, 120 burst
@@ -85,18 +88,8 @@ io.on('connection', (socket) => {
     next();
   });
 
-  socket.on('join-room', (roomId) => {
-    if (typeof roomId !== 'string' || !ROOM_ID.test(roomId)) return;
-    if (socket.data.roomId) socket.leave(socket.data.roomId);
-    socket.data.roomId = roomId;
-    socket.join(roomId);
-  });
-
-  registerCursorHandlers(io, socket);
-
-  socket.on('disconnect', () => {
-    socket.broadcast.emit('user-disconnected', socket.id);
-  });
+  registerRoomHandlers(io, socket);
+  registerCursorHandlers(io, socket);  
 });
 
 const PORT = process.env.PORT || 5000;
