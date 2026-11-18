@@ -6,7 +6,7 @@ export default function Auth() {
   const [isLogin, setIsLogin] = useState(true);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const { login } = useContext(AuthContext);
+  const { login, loginAsGuest } = useContext(AuthContext);
   const navigate = useNavigate();
 
   const handleSubmit = async (e) => {
@@ -39,6 +39,11 @@ export default function Auth() {
     }
   };
 
+  const continueAsGuest = async () => {
+    try { await loginAsGuest(); navigate('/'); }
+    catch { alert('Could not start a guest session'); }
+  };
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginTop: '20vh', fontFamily: 'sans-serif' }}>
       <h1>{isLogin ? 'Login to NetWrite' : 'Register for NetWrite'}</h1>
@@ -61,6 +66,12 @@ export default function Auth() {
         />
         <button type="submit" style={{ padding: '10px', fontSize: '16px', background: '#3b82f6', color: 'white', border: 'none', cursor: 'pointer' }}>
           {isLogin ? 'Login' : 'Register'}
+        </button>
+        <button
+          type="button" onClick={continueAsGuest}
+          style={{ marginTop: '15px', padding: '10px 20px', cursor: 'pointer' }}
+        >
+          Continue as guest
         </button>
       </form>
       <button 

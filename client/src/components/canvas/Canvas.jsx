@@ -5,6 +5,7 @@ import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { SHAPES, SHAPE_BOUNDS, ICON_BOUNDS, ICON_SIZE } from './shapes';
 import { MDI_PATHS } from './mdiSubset';
+import { apiFetch } from '../../services/api';
 
 const MIN_POINT_DISTANCE = 1;     // 1px radial prefilter
 const PREVIEW_INTERVAL_MS = 40;   // throttle for stroke:preview
@@ -30,7 +31,8 @@ const YJS_URL = 'ws://localhost:5000/yjs';
 const STROKE_FIELDS = [
   'id', 'userId', 'color', 'width', 'points', 'ts',
   'x', 'y', 'scaleX', 'scaleY', 'rotation',
-  'type', 'shapeType', 'iconName','text', 'fontSize'
+  'type', 'shapeType', 'iconName', 'text', 'fontSize',
+  'boxWidth', 'fontFamily', 'autoWidth'
 ];
 
 const num = (v, d) => (Number.isFinite(v) ? v : d);
@@ -54,6 +56,8 @@ function toPlain(ys) {
   if (type === 'icon' && !/^[a-z0-9-]{1,40}$/.test(iconName ?? '')) return null;
   const textVal = ys.get('text') ?? null;
   if (type === 'text' && typeof textVal !== 'string') return null;
+  const fontFamilyRaw = ys.get('fontFamily');
+  const fontFamily = Object.hasOwn(FONT_STACKS, fontFamilyRaw) ? fontFamilyRaw : 'sans';
   return {
     id: ys.get('id'),
     userId: ys.get('userId'),
@@ -69,6 +73,8 @@ function toPlain(ys) {
     type, shapeType, iconName,
     text: textVal,
     fontSize: num(ys.get('fontSize'), 20),
+    fontFamily, boxWidth: num(ys.get('boxWidth'), 200),
+    autoWidth: ys.get('autoWidth') !== false,
   };
 }
 
@@ -77,7 +83,15 @@ const byOrder = (a, b) => a.ts - b.ts || (a.id < b.id ? -1 : 1);
 // Per-handle sign for (pointer - anchor) along each axis, so the correct side always grows
 // and dragging past the anchor clamps instead of flipping/regrowing.
 const HANDLES = { nw: [-1, -1], ne: [1, -1], se: [1, 1], sw: [-1, 1], n: [0, -1], e: [1, 0], s: [0, 1], w: [-1, 0] };
-
+const TEXT_HANDLES = { e: [1, 0], w: [-1, 0] };
+const MIN_TEXT_BOX_PX = 40;
+const MAX_TEXT_BOX = 4000;
+const FONT_STACKS = {
+  sans: 'Inter, system-ui, sans-serif',
+  serif: 'Georgia, "Times New Roman", serif',
+  mono: '"JetBrains Mono", "Courier New", monospace',
+  hand: '"Comic Sans MS", cursive'
+};
 const round1 = (n) => Math.round(n * 10) / 10;
 const round4 = (n) => Math.round(n * 10000) / 10000;
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -108,24 +122,51 @@ const measureCanvas = typeof document !== 'undefined' ? document.createElement('
 const measureCtx = measureCanvas?.getContext('2d') ?? null;
 const textBoundsCache = new Map();
 
-function getTextBounds(stroke) {
-  const fontSize = stroke.fontSize || 20;
-  const key = `${fontSize}|${stroke.text}`;
-  let b = textBoundsCache.get(key);
-  if (b) return b;
+function wrapTextLines(text, fontSize, fontFamilyKey, boxWidth, autoWidth) {
+  const family = FONT_STACKS[fontFamilyKey] || FONT_STACKS.sans;
+  if (measureCtx) measureCtx.font = `${fontSize}px ${family}`;
+  const paragraphs = (text || '').split('\n');
 
-  const lines = (stroke.text || '').split('\n');
-  let maxW = 10;
-  if (measureCtx) {
-    measureCtx.font = `${fontSize}px Inter, system-ui, sans-serif`;
-    for (const line of lines) maxW = Math.max(maxW, measureCtx.measureText(line || ' ').width);
-  } else {
-    maxW = Math.max(maxW, ...lines.map((l) => l.length * fontSize * 0.6));
+  if (autoWidth) {
+    const lines = paragraphs.length ? paragraphs : [''];
+    let maxW = 20;
+    for (const line of lines) {
+      const w = measureCtx ? measureCtx.measureText(line || ' ').width : line.length * fontSize * 0.55;
+      if (w > maxW) maxW = w;
+    }
+    const lineHeight = fontSize * 1.3;
+    return { lines, height: lineHeight * lines.length, lineHeight, measuredWidth: maxW };
+  }
+
+  const lines = [];
+  for (const para of paragraphs) {
+    if (para === '') { lines.push(''); continue; }
+    const words = para.split(' ');
+    let line = '';
+    for (const word of words) {
+      const test = line ? `${line} ${word}` : word;
+      const w = measureCtx ? measureCtx.measureText(test).width : test.length * fontSize * 0.55;
+      if (w > boxWidth && line) { lines.push(line); line = word; }
+      else line = test;
+    }
+    lines.push(line);
   }
   const lineHeight = fontSize * 1.3;
-  b = { minX: 0, minY: 0, maxX: maxW, maxY: lineHeight * Math.max(lines.length, 1) };
+  return { lines, height: lineHeight * Math.max(lines.length, 1), lineHeight, measuredWidth: boxWidth };
+}
+
+function getTextBounds(stroke) {
+  const fontSize = stroke.fontSize || 20;
+  const fontFamily = stroke.fontFamily || 'sans';
+  const autoWidth = stroke.autoWidth !== false;
+  const boxWidth = stroke.boxWidth || 200;
+  const key = `${fontSize}|${fontFamily}|${autoWidth ? 'auto' : boxWidth}|${stroke.text}`;
+  let b = textBoundsCache.get(key);
+  if (b) return b;
+  const { lines, height, lineHeight, measuredWidth } = wrapTextLines(stroke.text, fontSize, fontFamily, boxWidth, autoWidth);
+  b = { minX: 0, minY: 0, maxX: measuredWidth, maxY: height, lines, lineHeight };
   textBoundsCache.set(key, b);
-  if (textBoundsCache.size > 500) textBoundsCache.clear(); // cheap unbounded-growth guard
+  if (textBoundsCache.size > 500) textBoundsCache.clear();
   return b;
 }
 
@@ -133,18 +174,16 @@ function drawText(ctx, stroke) {
   const b = getLocalBounds(stroke);
   const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
   const t = getTransform(stroke);
-  const fontSize = stroke.fontSize || 20;
-  const lineHeight = fontSize * 1.3;
+  const family = FONT_STACKS[stroke.fontFamily] || FONT_STACKS.sans;
 
   ctx.save();
   ctx.translate(cx + t.x, cy + t.y);
   ctx.rotate(t.rotation);
-  ctx.scale(t.scaleX, t.scaleY);
   ctx.translate(-cx, -cy);
-  ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
+  ctx.font = `${stroke.fontSize || 20}px ${family}`;
   ctx.fillStyle = stroke.color;
   ctx.textBaseline = 'top';
-  (stroke.text || '').split('\n').forEach((line, i) => ctx.fillText(line, b.minX, b.minY + i * lineHeight));
+  (b.lines || ['']).forEach((line, i) => ctx.fillText(line, b.minX, b.minY + i * b.lineHeight));
   ctx.restore();
 }
 
@@ -400,10 +439,10 @@ function getSelectionFrame(strokesMap, ids) {
   return { cx: (g.minX + g.maxX) / 2, cy: (g.minY + g.maxY) / 2, rot: 0, hw: (g.maxX - g.minX) / 2, hh: (g.maxY - g.minY) / 2 };
 }
 
-function hitTestHandles(f, wx, wy, cameraScale) {
+function hitTestHandles(f, wx, wy, cameraScale, handleSet = HANDLES) {
   const [px, py] = worldToFrame(f, wx, wy);
   const hs = HANDLE_SIZE_PX / cameraScale / 2;
-  for (const [key, [hx, hy]] of Object.entries(HANDLES)) {   // corners come first, so they win on tiny boxes
+  for (const [key, [hx, hy]] of Object.entries(handleSet)) {
     if (Math.abs(px - hx * f.hw) <= hs && Math.abs(py - hy * f.hh) <= hs) return key;
   }
   return null;
@@ -606,7 +645,8 @@ function drawStroke(ctx, stroke) {
 // Component
 // ---------------------------------------------------------------------------
 
-const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraChange, onToolChange, onSelectionChange }, ref) => {
+const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, canWrite = false,
+  onCameraChange, onToolChange, onSelectionChange, onYjsClosed, onYjsConnected }, ref) => {
   const lastCursorEmitRef = useRef(0);
   const canvasRef = useRef(null);
   const { user } = useContext(AuthContext);
@@ -619,6 +659,12 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   onToolChangeRef.current = onToolChange;
   const onSelectionChangeRef = useRef(onSelectionChange);
   onSelectionChangeRef.current = onSelectionChange;
+  const canWriteRef = useRef(canWrite);
+  canWriteRef.current = canWrite;
+  const onYjsClosedRef = useRef(onYjsClosed);
+  onYjsClosedRef.current = onYjsClosed;
+  const onYjsConnectedRef = useRef(onYjsConnected);
+  onYjsConnectedRef.current = onYjsConnected;
   const eraserRef = useRef(null);   // last eraser position (world) while the eraser button is down
 
   // Refs, not state: drawing is imperative, and we don't want a React re-render per point.
@@ -636,6 +682,9 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   const activeToolRef = useRef('select');
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [editingTextId, setEditingTextId] = useState(null);
+  const editingTextIdRef = useRef(null);
+  const textEditInitRef = useRef(null);
+  const setEditingText = (id) => { editingTextIdRef.current = id; setEditingTextId(id); };
   const selectedIdsRef = useRef(new Set());
   const ydocRef = useRef(null);
   const yStrokesRef = useRef(null);
@@ -660,14 +709,17 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     const { x, y, scale } = cameraRef.current;
     ctx.setTransform(scale, 0, 0, scale, x, y);    // everything below is drawn in world space
 
-    for (const stroke of strokesRef.current.values()) drawStroke(ctx, stroke);
+    for (const stroke of strokesRef.current.values()) {
+      if (stroke.id === editingTextIdRef.current) continue;
+      drawStroke(ctx, stroke);
+    }
     for (const preview of peerPreviewsRef.current.values()) drawStroke(ctx, preview);
     if (currentStrokeRef.current) drawStroke(ctx, currentStrokeRef.current);
 
     const selected = selectedIdsRef.current;
 
     // Selection outlines: animated dashed border hugging each selected stroke's ink
-    if (selected.size) {
+    if (selected.size && canWriteRef.current) {
       const period = SELECTION_DASH_PX[0] + SELECTION_DASH_PX[1];
       const phase = ((performance.now() / 1000) * MARCH_SPEED_PX) % period; // wrap to avoid huge numbers
 
@@ -690,7 +742,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       }
       ctx.restore();
 
-            const frame = getSelectionFrame(strokesRef.current, selected);
+      const frame = getSelectionFrame(strokesRef.current, selected);
       if (frame) {
         const hs = HANDLE_SIZE_PX / scale / 2;
         ctx.save();
@@ -712,7 +764,9 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
         ctx.beginPath(); ctx.arc(rhx, rhy, ROTATE_HANDLE_RADIUS_PX / scale, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
 
         ctx.lineWidth = 1.5 / scale;                        // 8 resize handles
-        for (const [hx, hy] of Object.values(HANDLES)) {
+        const onlySel = selected.size === 1 ? strokesRef.current.get([...selected][0]) : null;
+        const activeHandles = onlySel?.type === 'text' ? TEXT_HANDLES : HANDLES;
+        for (const [hx, hy] of Object.values(activeHandles)) {
           const [px, py] = frameToWorld(frame, hx * frame.hw, hy * frame.hh);
           ctx.save();
           ctx.translate(px, py);
@@ -798,6 +852,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   };
 
   const setTool = (tool) => {
+    if (tool !== 'select' && !canWriteRef.current) return;
     if (tool !== 'select' && tool !== 'pen' && tool !== 'eraser') return;
     activeToolRef.current = tool;
     setActiveTool(tool);
@@ -810,6 +865,10 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
 
   // All writes go to Yjs. The observer updates the strokesRef mirror and redraws.
   const addStroke = (s) => {
+    if (!canWriteRef.current) {
+      if (collapseTo) setSelection(new Set([collapseTo]));
+      return;
+    }
     const ydoc = ydocRef.current;
     if (!ydoc) return;
     ydoc.transact(() => {
@@ -820,11 +879,13 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
   };
 
   const removeStroke = (id) => {
+    if (!canWriteRef.current) return;
     ydocRef.current?.transact(() => yStrokesRef.current.delete(id));
   };
 
   // patches: [{ id, x?, y?, scaleX?, scaleY?, rotation? }]. Writes only the fields that changed.
   const patchStroke = (patches) => {
+    if (!canWriteRef.current) return;
     const ydoc = ydocRef.current;
     if (!ydoc) return;
     ydoc.transact(() => {
@@ -838,6 +899,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
 
   // Delete every stroke under (wx, wy). Loops because strokes can overlap.
   const eraseAt = (wx, wy) => {
+    if (!canWriteRef.current) return;
     const tolWorld = ERASER_RADIUS_PX / cameraRef.current.scale;
     let erased = false;
     let hit;
@@ -852,8 +914,9 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     }
   };
 
-    // Drop a new shape/icon at the center of the current view, sized ~1x on screen, and select it
+  // Drop a new shape/icon at the center of the current view, sized ~1x on screen, and select it
   const spawn = (fields) => {
+    if (!canWriteRef.current) return;
     const canvas = canvasRef.current;
     const [wx, wy] = screenToWorld(canvas.width / 2, canvas.height / 2);
     const k = round4(clamp(1 / cameraRef.current.scale, MIN_OBJECT_SCALE, MAX_OBJECT_SCALE));
@@ -867,8 +930,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     setSelection(new Set([s.id]));
   };
 
-  const undo = () => { undoManagerRef.current?.undo(); };
-  const redo = () => { undoManagerRef.current?.redo(); };
+  const undo = () => { if (!canWriteRef.current) return; undoManagerRef.current?.undo(); };
+  const redo = () => { if (!canWriteRef.current) return; undoManagerRef.current?.redo(); };
 
   useEffect(() => {
     const onKey = (e) => {
@@ -887,7 +950,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       else if (k === 'p') setTool('pen');
       else if (k === 'e') setTool('eraser');
       else if (e.key === 'Escape' && selectedIdsRef.current.size) setSelection(new Set());
-      else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIdsRef.current.size) {
+      else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIdsRef.current.size && canWriteRef.current) {
         e.preventDefault();
         const ids = [...selectedIdsRef.current];
         undoManagerRef.current?.stopCapturing();
@@ -898,6 +961,19 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
+
+  useEffect(() => {
+    if (canWrite) return;
+    currentStrokeRef.current = null;
+    eraserRef.current = null;
+    const it = interactionRef.current;
+    if (it && it.type !== 'marquee') interactionRef.current = null;
+    setEditingText(null);
+    providerRef.current?.awareness.setLocalStateField('preview', null);
+    if (activeToolRef.current !== 'select') setTool('select');
+    scheduleRedraw();
+  }, [canWrite]);
+
 
   useImperativeHandle(ref, () => ({
     undo,
@@ -912,34 +988,27 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     addShape: (shapeType) => { if (Object.hasOwn(SHAPES, shapeType)) spawn({ type: 'shape', shapeType }); },
     addIcon: (iconName) => { if (Object.hasOwn(MDI_PATHS, iconName)) spawn({ type: 'icon', iconName, width: 1 }); },
     addText: () => {
+      if (!canWriteRef.current) return;
       const canvas = canvasRef.current;
       const [wx, wy] = screenToWorld(canvas.width / 2, canvas.height / 2);
       const id = crypto.randomUUID();
       const s = {
         id, userId, color, width: 1, points: [], ts: Date.now(),
         x: round1(wx), y: round1(wy), scaleX: 1, scaleY: 1, rotation: 0,
-        type: 'text', text: 'Text', fontSize: 20
+        type: 'text', text: 'Text', fontSize: 20, fontFamily: 'sans', boxWidth: 200, autoWidth: true
       };
       undoManagerRef.current?.stopCapturing();
       addStroke(s);
       setTool('select');
       setSelection(new Set([id]));
-      setEditingTextId(id);
+      setEditingText(id);
     },
     clearBoard: () => {
-      const ydoc = ydocRef.current;
-      if (!ydoc) return;
-      ydoc.transact(() => {
-        yStrokesRef.current.clear();
-        const meta = ydoc.getMap('meta');
-        meta.set('clearEpoch', (meta.get('clearEpoch') ?? 0) + 1); // tells every client to reset undo/redo
-      });
+      socket.emit('clear-board', null, (ok) => { if (!ok) alert('Only the host or a co-host can clear the board.'); });
     },
     saveToDatabase: async () => {
       try {
-        const res = await fetch(`http://localhost:5000/api/boards/${roomId}`, {
-          method: 'POST'
-        });
+        const res = await apiFetch(`/api/boards/${roomId}`, { method: 'POST' });
         if (!res.ok) throw new Error(`Server responded ${res.status}`);
         alert('Board saved successfully!');
       } catch (error) {
@@ -983,6 +1052,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       });
     },
     deleteSelected: () => {
+      if (!canWriteRef.current) return;
       const ids = [...selectedIdsRef.current];
       if (!ids.length) return;
       undoManagerRef.current?.stopCapturing();
@@ -990,6 +1060,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       setSelection(new Set());
     },
     duplicateSelected: () => {
+      if (!canWriteRef.current) return;
       const ids = [...selectedIdsRef.current];
       if (!ids.length) return;
       const OFFSET = 16;
@@ -1005,6 +1076,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       setSelection(new Set(newIds));
     },
     updateSelectedStyle: (fields) => {
+      if (!canWriteRef.current) return;
       const ids = [...selectedIdsRef.current];
       if (!ids.length) return;
       undoManagerRef.current?.stopCapturing();
@@ -1012,10 +1084,12 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       scheduleRedraw();
     },
     getSelectedObjects: () => [...selectedIdsRef.current].map((id) => strokesRef.current.get(id)).filter(Boolean)
-    
+
   }));
 
   useEffect(() => {
+    if (!ticket) return;
+    let disposed = false;
     const canvas = canvasRef.current;
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
@@ -1024,7 +1098,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     const ydoc = new Y.Doc();
     const yStrokes = ydoc.getMap('strokes');
     const yMeta = ydoc.getMap('meta');
-    const provider = new WebsocketProvider(YJS_URL, roomId, ydoc); // connects to ws://.../yjs/<roomId>
+    const provider = new WebsocketProvider(YJS_URL, roomId, ydoc, { params: { ticket }, connect: false });
+    const connectTimer = setTimeout(() => provider.connect(), 0);
     const awareness = provider.awareness;
     ydocRef.current = ydoc;
     yStrokesRef.current = yStrokes;
@@ -1035,6 +1110,14 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     currentStrokeRef.current = null;
     interactionRef.current = null;
 
+    let closedOnce = false;
+    provider.on('connection-close', (ev) => {
+      if (disposed || closedOnce) return;
+      closedOnce = true;
+      provider.disconnect();
+      onYjsClosedRef.current?.(ev?.code ?? 1006);
+    });
+    provider.on('status', ({ status }) => { if (status === 'connected') onYjsConnectedRef.current?.(); });
     // Keep the strokesRef mirror in sync. Fires for local AND remote changes (and initial sync).
     const onStrokesChange = (events) => {
       const ids = new Set();
@@ -1126,14 +1209,11 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('blur', onBlur);
 
-    const join = () => socket.emit('join-room', roomId);
-    socket.on('connect', join);
-    if (socket.connected) join();
-
     redrawAll();
 
     return () => {
-      socket.off('connect', join);
+      disposed = true;
+      clearTimeout(connectTimer);
       yStrokes.unobserveDeep(onStrokesChange);
       yMeta.unobserve(onMetaChange);
       awareness.off('change', onAwareness);
@@ -1153,16 +1233,17 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       undoManager.destroy();
       undoManagerRef.current = null;
     };
-  }, [roomId]);
+  }, [roomId, ticket]);
 
   // ---- pointer handling -------------------------------------------------------------
   const commitTextEdit = (id, value) => {
-  setEditingTextId(null);
-  const text = value.trim() || 'Text';
-  undoManagerRef.current?.stopCapturing();
-  patchStroke([{ id, text }]);
-  scheduleRedraw();
-};
+    setEditingText(null);
+    textEditInitRef.current = null;
+    const text = value.trim() || 'Text';
+    undoManagerRef.current?.stopCapturing();
+    patchStroke([{ id, text }]);
+    scheduleRedraw();
+  };
 
   const handleDoubleClick = (e) => {
     if (activeToolRef.current !== 'select') return;
@@ -1171,7 +1252,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     const hit = hitTestStrokes(strokesRef.current, wx, wy, HIT_TOLERANCE_PX / cameraRef.current.scale);
     if (hit?.type === 'text') {
       setSelection(new Set([hit.id]));
-      setEditingTextId(hit.id);
+      setEditingText(hit.id);
     }
   };
 
@@ -1197,8 +1278,32 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       if (selected.size) {
         const frame = getSelectionFrame(strokesRef.current, selected);
         const camScale = cameraRef.current.scale;
-        const handle = frame ? hitTestHandles(frame, wx, wy, camScale) : null;
+        const onlyId = selected.size === 1 ? [...selected][0] : null;
+        const onlyStroke = onlyId ? strokesRef.current.get(onlyId) : null;
+        const isTextOnly = onlyStroke?.type === 'text';
+        const handleSet = isTextOnly ? TEXT_HANDLES : HANDLES;
+        const handle = frame ? hitTestHandles(frame, wx, wy, camScale, handleSet) : null;
+
         if (handle) {
+          if (isTextOnly) {
+            const b = getLocalBounds(onlyStroke);
+            const t = getTransform(onlyStroke);
+            const centerLocal = [(b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2];
+            const anchorLocal = handle === 'e' ? [b.minX, 0] : [b.maxX, 0];
+            const dx = anchorLocal[0] - centerLocal[0], dy = anchorLocal[1] - centerLocal[1];
+            const cos = Math.cos(t.rotation), sin = Math.sin(t.rotation);
+            const anchorWorld = [
+              centerLocal[0] + t.x + dx * cos - dy * sin,
+              centerLocal[1] + t.y + dx * sin + dy * cos
+            ];
+            interactionRef.current = {
+              type: 'textResize', id: onlyStroke.id, handle, anchorWorld, rotation: t.rotation,
+              fontSize: onlyStroke.fontSize || 20, fontFamily: onlyStroke.fontFamily || 'sans', text: onlyStroke.text || ''
+            };
+            canvasRef.current.style.cursor = 'ew-resize';
+            return;
+          }
+
           const [hx, hy] = HANDLES[handle];
           const starts = new Map();
           for (const id of selected) {
@@ -1284,6 +1389,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
 
     // ---- Eraser tool: destroys objects, never creates strokes ----
     if (activeToolRef.current === 'eraser') {
+      if (!canWriteRef.current) return;
       undoManagerRef.current?.stopCapturing();
       eraserRef.current = [wx, wy];
       eraseAt(wx, wy);
@@ -1299,6 +1405,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       points: [wx, wy],
       type: 'path'
     };
+    if (!canWriteRef.current) return;
     lastPreviewEmitRef.current = 0;
     scheduleRedraw();
   };
@@ -1310,7 +1417,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
     const t = performance.now();
     if (t - lastCursorEmitRef.current >= 33) { // ~30 cursor updates/s is plenty
       lastCursorEmitRef.current = t;
-      socket.emit('cursor-move', { roomId, x, y, username: user?.username || 'Unknown' });
+      socket.emit('cursor-move', { x, y });
     }
 
     if (panRef.current) {                          // panning: move the camera by the screen delta
@@ -1324,11 +1431,16 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
 
     const it = interactionRef.current;
 
-    if (!it && activeToolRef.current === 'select' && selectedIdsRef.current.size) {
+    if (!it && activeToolRef.current === 'select' && selectedIdsRef.current.size && canWriteRef.current) {
       const f = getSelectionFrame(strokesRef.current, selectedIdsRef.current);
       const cs = cameraRef.current.scale;
-      const handle = f ? hitTestHandles(f, x, y, cs) : null;
-      canvasRef.current.style.cursor = handle ? cursorForHandle(handle) : f && hitTestRotateHandle(f, x, y, cs) ? 'grab' : '';
+      const onlyId = selectedIdsRef.current.size === 1 ? [...selectedIdsRef.current][0] : null;
+      const isTextOnly = onlyId && strokesRef.current.get(onlyId)?.type === 'text';
+      const handleSet = isTextOnly ? TEXT_HANDLES : HANDLES;
+      const handle = f ? hitTestHandles(f, x, y, cs, handleSet) : null;
+      canvasRef.current.style.cursor = handle
+        ? (isTextOnly ? 'ew-resize' : cursorForHandle(handle))
+        : f && hitTestRotateHandle(f, x, y, cs) ? 'grab' : '';
     }
 
     // ---- Select tool interactions ----
@@ -1398,6 +1510,31 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
         scheduleRedraw();
       } else if (it.type === 'marquee') {
         it.current = [x, y];
+        scheduleRedraw();
+      } else if (it.type === 'textResize') {
+        const [ax, ay] = it.anchorWorld;
+        const cos = Math.cos(-it.rotation), sin = Math.sin(-it.rotation);
+        const dxw = x - ax, dyw = y - ay;
+        const relX = dxw * cos - dyw * sin;
+        const minW = MIN_TEXT_BOX_PX / cameraRef.current.scale;
+        const rawW = it.handle === 'e' ? relX : -relX;
+        const newBoxWidth = round1(clamp(rawW, minW, MAX_TEXT_BOX));
+
+        const { height } = wrapTextLines(it.text, it.fontSize, it.fontFamily, newBoxWidth);
+        const cxNew = newBoxWidth / 2, cyNew = height / 2;
+        const anchorLocalX = it.handle === 'e' ? 0 : newBoxWidth;
+        const dxl = anchorLocalX - cxNew, dyl = 0 - cyNew;
+        const cosR = Math.cos(it.rotation), sinR = Math.sin(it.rotation);
+        const rotatedX = dxl * cosR - dyl * sinR, rotatedY = dxl * sinR + dyl * cosR;
+        const centerWorldX = ax - rotatedX, centerWorldY = ay - rotatedY;
+
+        patchStroke([{
+          id: it.id,
+          x: round1(centerWorldX - cxNew),
+          y: round1(centerWorldY - cyNew),
+          boxWidth: newBoxWidth,
+          autoWidth: false
+        }]);
         scheduleRedraw();
       }
       return;
@@ -1475,24 +1612,6 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
       scheduleRedraw();
       return;
     }
-    const commitTextEdit = (id, value) => {
-      setEditingTextId(null);
-      const text = value.trim() || 'Text';
-      undoManagerRef.current?.stopCapturing();
-      patchStroke([{ id, text }]);
-      scheduleRedraw();
-    };
-
-    const handleDoubleClick = (e) => {
-      if (activeToolRef.current !== 'select') return;
-      const { offsetX, offsetY } = e.nativeEvent;
-      const [wx, wy] = screenToWorld(offsetX, offsetY);
-      const hit = hitTestStrokes(strokesRef.current, wx, wy, HIT_TOLERANCE_PX / cameraRef.current.scale);
-      if (hit?.type === 'text') {
-        setSelection(new Set([hit.id]));
-        setEditingTextId(hit.id);
-      }
-    };
     // ---- Pen tool (unchanged) ----
 
     // ---- Pen tool (unchanged) ----
@@ -1532,30 +1651,64 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, onCameraC
         const cam = cameraRef.current;
         const screenX = wb.minX * cam.scale + cam.x;
         const screenY = wb.minY * cam.scale + cam.y;
-        const screenW = Math.max((wb.maxX - wb.minX) * cam.scale, 60);
-        const screenH = Math.max((wb.maxY - wb.minY) * cam.scale, 30);
-        const screenFont = (s.fontSize || 20) * (s.scaleY ?? 1) * cam.scale;
+        const screenFont = (s.fontSize || 20) * cam.scale;
+        const family = FONT_STACKS[s.fontFamily] || FONT_STACKS.sans;
+        const autoWidth = s.autoWidth !== false;
+
+        const autoGrow = (el) => {
+          el.style.height = 'auto';
+          el.style.height = `${el.scrollHeight}px`;
+          if (autoWidth) {
+            let maxW = 20;
+            if (measureCtx) {
+              measureCtx.font = `${screenFont}px ${family}`;
+              for (const line of el.value.split('\n')) {
+                const w = measureCtx.measureText(line || ' ').width;
+                if (w > maxW) maxW = w;
+              }
+            }
+            el.style.width = `${maxW + 8}px`;
+          }
+        };
+
         return (
           <textarea
-            autoFocus
+            key={editingTextId}
+            ref={(el) => {
+              if (!el) return;
+              autoGrow(el);
+              if (textEditInitRef.current !== editingTextId) {
+                textEditInitRef.current = editingTextId;
+                el.focus();
+                el.select();
+              }
+            }}
             defaultValue={s.text}
+            onInput={(e) => {
+              autoGrow(e.target);
+              const live = strokesRef.current.get(editingTextId); // live-updates the ants outline while typing
+              if (live) { live.text = e.target.value; scheduleRedraw(); }
+            }}
             onBlur={(e) => commitTextEdit(editingTextId, e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.blur(); }
               if (e.key === 'Escape') { e.target.value = s.text; e.target.blur(); }
             }}
             style={{
-              position: 'absolute', left: screenX, top: screenY, width: screenW, minHeight: screenH,
-              font: `${screenFont}px Inter, system-ui, sans-serif`, color: s.color,
-              border: '1px dashed #2563eb', background: 'rgba(255,255,255,0.9)', padding: 0,
-              resize: 'none', outline: 'none', lineHeight: 1.3, overflow: 'hidden', zIndex: 15
+              position: 'absolute', left: screenX, top: screenY,
+              width: autoWidth ? undefined : Math.max((s.boxWidth || 200) * cam.scale, 40),
+              font: `${screenFont}px ${family}`, color: s.color,
+              border: 'none', background: 'transparent', padding: 0,
+              resize: 'none', outline: 'none', lineHeight: 1.3, overflow: 'hidden', zIndex: 15,
+              whiteSpace: autoWidth ? 'pre' : 'pre-wrap', wordBreak: autoWidth ? 'normal' : 'break-word',
+              caretColor: s.color
             }}
           />
         );
       })()}
     </>
   );
- 
+
 });
 
 export default Canvas;
