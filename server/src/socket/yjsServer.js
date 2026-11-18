@@ -138,6 +138,7 @@ export function attachYjs(server) {
     ws.roomId = roomId;
     ws.couldWrite = canWrite(room, identityId);
     setupWSConnection(ws, req, { docName: roomId });
+    ws.ydoc = docs.get(roomId);
     guardConnection(ws);
     addConn(room, identityId, 'yjs', ws);              // so kick can find and close this socket
 

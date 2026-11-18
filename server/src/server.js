@@ -50,7 +50,11 @@ if (!mongoURI) {
 
 // API Routes
 app.use('/api', rateLimit({ windowMs: 60_000, limit: 120 }));
-app.use('/api/auth', rateLimit({ windowMs: 15 * 60_000, limit: 20 })); // brute-force protection for login
+app.use('/api/auth/guest', rateLimit({ windowMs: 15 * 60_000, limit: 200 }));
+app.use('/api/auth', rateLimit({
+  windowMs: 15 * 60_000, limit: 20,
+  skip: (req) => req.path === '/guest',
+}));
 app.use('/api/boards', boardRoutes);
 app.use('/api/auth', authRoutes);
 

@@ -5,10 +5,21 @@ import User from '../models/User.js';
 import { signGuestToken } from '../middlewares/authMiddleware.js';
 const router = express.Router();
 
+// A JSON body can hold objects like { "$ne": "" }. Accept plain strings only.
+const creds = (body) => {
+  const { username, password } = body ?? {};
+  if (typeof username !== 'string' || typeof password !== 'string') return null;
+  const u = username.trim();
+  if (u.length < 3 || u.length > 32 || password.length < 6 || password.length > 128) return null;
+  return { username: u, password };
+};
+
 // Register a new user
 router.post('/register', async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const c = creds(req.body);
+    if (!c) return res.status(400).json({ message: 'Invalid username or password' });
+    const { username, password } = c;
 
     // Check if user exists
     const existingUser = await User.findOne({ username });
@@ -33,7 +44,9 @@ router.post('/register', async (req, res) => {
 // Login user
 router.post('/login', async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const c = creds(req.body);
+    if (!c) return res.status(400).json({ message: 'Invalid credentials' });
+    const { username, password } = c;
 
     // Find user
     const user = await User.findOne({ username });

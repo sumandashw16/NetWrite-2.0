@@ -9,6 +9,8 @@ export const MAX_MESSAGE_BYTES = 64 * 1024;      // awareness and other messages
 export const MAX_SYNC_BYTES = 4 * 1024 * 1024;   // sync messages carry document state
 const MSG_RATE = 200, MSG_BURST = 400;
 const BYTE_RATE = 512 * 1024, BYTE_BURST = 4 * 1024 * 1024; // burst must fit one full sync
+const MAX_DELETES_PER_UPDATE = 100;   // strokes one client message may delete
+const MAX_SCAN = 500_000;             // delete-set entries examined per message
 
 // ---- Layer 3 ----
 const MAX_STROKES = 20_000;
@@ -106,6 +108,58 @@ const mayWrite = (ws) => {
   const room = getRoom(ws.roomId);
   return !!room && canWrite(room, ws.identityId);
 };
+if (typeof Y.decodeUpdate !== 'function' || typeof Y.getItem !== 'function') {
+  console.error('[guard] this yjs version lacks decodeUpdate/getItem: write gate is incomplete');
+}
+
+// Sync frame -> the raw Yjs update inside it
+function syncPayload(bytes) {
+  const d = decoding.createDecoder(bytes);
+  decoding.readVarUint(d);   // message type
+  decoding.readVarUint(d);   // sync subtype
+  return decoding.readVarUint8Array(d);
+}
+
+// Looks at the update BEFORE it is merged. Returns a reason string, or null if fine.
+function updateViolation(ydoc, update) {
+  const { structs, ds } = Y.decodeUpdate(update);
+  for (const s of structs) if (s.parent === 'meta') return 'client write to meta';
+
+  const strokes = ydoc.getMap('strokes');
+  let removed = 0, scanned = 0;
+  for (const [client, ranges] of ds.clients) {
+    const have = Y.getState(ydoc.store, client);
+    for (const { clock, len } of ranges) {
+      for (let c = clock; c < clock + len && c < have; ) {
+        if (++scanned > MAX_SCAN) return 'delete set too large';
+        const item = Y.getItem(ydoc.store, Y.createID(client, c));
+        // count only live top-level stroke entries (not field overwrites, not already-deleted items)
+        if (!item.deleted && item.parent === strokes && item.parentSub != null) removed++;
+        c += Math.max(1, (item.length ?? 1) - (c - item.id.clock));
+      }
+    }
+  }
+  return removed > MAX_DELETES_PER_UPDATE ? `bulk delete (${removed} strokes)` : null;
+}
+
+// Awareness frame: does any state carry a live-stroke preview?
+function awarenessHasPreview(bytes) {
+  try {
+    const d = decoding.createDecoder(bytes);
+    decoding.readVarUint(d);
+    const inner = decoding.createDecoder(decoding.readVarUint8Array(d));
+    const n = decoding.readVarUint(inner);
+    for (let i = 0; i < n; i++) {
+      decoding.readVarUint(inner);   // clientID
+      decoding.readVarUint(inner);   // clock
+      const state = JSON.parse(decoding.readVarString(inner));
+      if (state && state.preview) return true;
+    }
+    return false;
+  } catch {
+    return true;   // unparseable from a non-writer: drop it
+  }
+}
 // Call AFTER setupWSConnection: wraps its message listener so bad packets never reach it
 export function guardConnection(ws) {
   // An unhandled 'error' event on a ws socket throws and takes the whole process down
@@ -132,12 +186,25 @@ export function guardConnection(ws) {
       console.warn(`[guard] bad frame: ${bad} size=${size} head=${Buffer.from(bytes).subarray(0, 16).toString('hex')}`);
       if (ENFORCE_FRAME_CHECK) return kick(ws, `malformed frame: ${bad}`);
     }
-    // PRE-MERGE write gate. Subtype 0 = sync step 1 (a read request) is always fine.
-    // Subtypes 1 (step 2) and 2 (update) carry mutations.
-    if (bytes[0] === 0 && bytes[1] !== 0 && !mayWrite(ws)) {
-      if (isEmptySync(bytes)) return;   // a read-only client's normal "nothing to add" reply
-      return denyWrite(ws);             // real mutation: nothing reaches the doc
+    
+    const writer = mayWrite(ws);   // looked up live, nothing cached
+
+    if (bytes[0] === 0 && bytes[1] !== 0) {            // sync step 2 / update = mutation
+      if (!writer) {
+        if (isEmptySync(bytes)) return;
+        return denyWrite(ws);
+      }
+      let why;
+      try { why = updateViolation(ws.ydoc, syncPayload(bytes)); }
+      catch (err) { return kick(ws, `undecodable update: ${err.message}`); }
+      if (why) {
+        console.warn(`[guard] ${ws.identityId} in ${ws.roomId}: ${why}`);
+        return denyWrite(ws);   // no strike: 4403 makes the client resync
+      }
     }
+
+    // Read-only users keep cursors/presence, but may not broadcast fake live strokes
+    if (bytes[0] === 1 && !writer && awarenessHasPreview(bytes)) return;
 
     activeConn = ws;
     try {
