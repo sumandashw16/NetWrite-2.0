@@ -6,7 +6,7 @@ import { WebsocketProvider } from 'y-websocket';
 import { SHAPES, SHAPE_BOUNDS, ICON_BOUNDS, ICON_SIZE } from './shapes';
 import { MDI_PATHS } from './mdiSubset';
 import { apiFetch } from '../../services/api';
-
+import { BOARD_THEMES, DEFAULT_THEME } from './boardThemes';
 const MIN_POINT_DISTANCE = 1;     // 1px radial prefilter
 const PREVIEW_INTERVAL_MS = 40;   // throttle for stroke:preview
 const UPDATE_INTERVAL_MS = 40;    // throttle for stroke:update while dragging/scaling/rotating
@@ -17,7 +17,6 @@ const MIN_OBJECT_SCALE = 0.05;    // per-stroke scaleX/scaleY clamp (stays insid
 const MAX_OBJECT_SCALE = 20;
 const HIT_TOLERANCE_PX = 4;       // extra click slop around a stroke (screen px)
 const DRAG_THRESHOLD_PX = 3;      // pointer must move this far before a click becomes a drag
-const SELECTION_COLOR = '#2563eb';
 const ERASER_RADIUS_PX = 8;       // eraser reach around the pointer (screen px)
 const OUTLINE_PAD_PX = 3;         // gap between the ink edge and the dashed outline (screen px)
 const SELECTION_DASH_PX = [6, 4]; // dash, gap (screen px)
@@ -646,6 +645,7 @@ function drawStroke(ctx, stroke) {
 // ---------------------------------------------------------------------------
 
 const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, canWrite = false,
+  boardTheme = DEFAULT_THEME, onThemeChange,
   onCameraChange, onToolChange, onSelectionChange, onYjsClosed, onYjsConnected }, ref) => {
   const lastCursorEmitRef = useRef(0);
   const canvasRef = useRef(null);
@@ -666,7 +666,10 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, c
   const onYjsConnectedRef = useRef(onYjsConnected);
   onYjsConnectedRef.current = onYjsConnected;
   const eraserRef = useRef(null);   // last eraser position (world) while the eraser button is down
-
+  const themeRef = useRef(BOARD_THEMES[boardTheme] ?? BOARD_THEMES[DEFAULT_THEME]);
+  themeRef.current = BOARD_THEMES[boardTheme] ?? BOARD_THEMES[DEFAULT_THEME];
+  const onThemeChangeRef = useRef(onThemeChange);
+  onThemeChangeRef.current = onThemeChange;
   // Refs, not state: drawing is imperative, and we don't want a React re-render per point.
   const strokesRef = useRef(new Map());        // finalized strokes: id -> stroke
   const currentStrokeRef = useRef(null);       // my in-progress stroke
@@ -702,7 +705,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, c
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
-
+    const SEL = themeRef.current.selection;
     ctx.setTransform(1, 0, 0, 1, 0, 0);            // identity, so clearRect covers the whole screen
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -724,7 +727,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, c
       const phase = ((performance.now() / 1000) * MARCH_SPEED_PX) % period; // wrap to avoid huge numbers
 
       ctx.save();
-      ctx.strokeStyle = SELECTION_COLOR;
+      ctx.strokeStyle = SEL;
       ctx.lineWidth = 1 / scale;
       ctx.setLineDash(SELECTION_DASH_PX.map((d) => d / scale));
       ctx.lineDashOffset = -phase / scale;      // negative = dashes travel forward along the path
@@ -746,7 +749,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, c
       if (frame) {
         const hs = HANDLE_SIZE_PX / scale / 2;
         ctx.save();
-        ctx.strokeStyle = SELECTION_COLOR;
+        ctx.strokeStyle = SEL;
         ctx.fillStyle = '#fff';
         ctx.lineWidth = 1 / scale;
 
@@ -782,7 +785,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, c
         const rotIt = interactionRef.current;
         if (rotIt?.type === 'rotate') {
           ctx.save();
-          ctx.fillStyle = SELECTION_COLOR;
+          ctx.fillStyle = SEL;
           ctx.font = `${12 / scale}px sans-serif`;
           ctx.textAlign = 'center';
           ctx.fillText(`${rotIt.degreesLabel}°`, rhx, rhy - 14 / scale);
@@ -799,8 +802,8 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, c
       const rx = Math.min(x0, x1), ry = Math.min(y0, y1);
       const rw = Math.abs(x1 - x0), rh = Math.abs(y1 - y0);
       ctx.save();
-      ctx.fillStyle = 'rgba(37, 99, 235, 0.1)';
-      ctx.strokeStyle = SELECTION_COLOR;
+      ctx.fillStyle = `${SEL}1a`;
+      ctx.strokeStyle = SEL;
       ctx.lineWidth = 1 / scale;
       ctx.fillRect(rx, ry, rw, rh);
       ctx.strokeRect(rx, ry, rw, rh);
@@ -820,7 +823,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, c
       redrawAll();
     });
   };
-
+  useEffect(() => { scheduleRedraw(); }, [boardTheme]);
   // world = (screen - camera) / scale
   const screenToWorld = (sx, sy) => {
     const c = cameraRef.current;
@@ -865,10 +868,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, c
 
   // All writes go to Yjs. The observer updates the strokesRef mirror and redraws.
   const addStroke = (s) => {
-    if (!canWriteRef.current) {
-      if (collapseTo) setSelection(new Set([collapseTo]));
-      return;
-    }
+    if (!canWriteRef.current) return;
     const ydoc = ydocRef.current;
     if (!ydoc) return;
     ydoc.transact(() => {
@@ -985,6 +985,11 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, c
       Object.assign(cameraRef.current, { x: 0, y: 0, scale: 1 });
       cameraChanged();
     },
+    setBoardTheme: (key) => {
+      if (!canWriteRef.current || !Object.hasOwn(BOARD_THEMES, key)) return;
+      const ydoc = ydocRef.current;
+      ydoc?.transact(() => ydoc.getMap('meta').set('theme', key));
+    },
     addShape: (shapeType) => { if (Object.hasOwn(SHAPES, shapeType)) spawn({ type: 'shape', shapeType }); },
     addIcon: (iconName) => { if (Object.hasOwn(MDI_PATHS, iconName)) spawn({ type: 'icon', iconName, width: 1 }); },
     addText: () => {
@@ -1037,7 +1042,7 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, c
       off.width = w;
       off.height = h;
       const ctx = off.getContext('2d');
-      ctx.fillStyle = '#fff';           // omit this line for a transparent background
+      ctx.fillStyle = themeRef.current.board;
       ctx.fillRect(0, 0, w, h);
       ctx.translate(-minX + PAD, -minY + PAD);
       for (const s of strokes) drawStroke(ctx, s);
@@ -1146,8 +1151,14 @@ const Canvas = forwardRef(({ color = '#000000', brushSize = 5, roomId, ticket, c
     };
     yStrokes.observeDeep(onStrokesChange);
 
-    // Board cleared by anyone: wipe undo history so nobody can resurrect strokes that were deleted for everyone
-    const onMetaChange = () => {
+    const readTheme = () => {
+      const t = yMeta.get('theme');
+      return Object.hasOwn(BOARD_THEMES, t) ? t : DEFAULT_THEME;
+    };
+    const onMetaChange = (event) => {
+      if (event.keysChanged.has('theme')) onThemeChangeRef.current?.(readTheme());
+      // a theme change on its own must not reset interactions or the undo stack
+      if (event.keysChanged.size === 1 && event.keysChanged.has('theme')) return;
       interactionRef.current = null;
       // microtask: lets the UndoManager finish recording the clear transaction first, then wipe it
       queueMicrotask(() => undoManagerRef.current?.clear());
