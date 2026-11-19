@@ -1,0 +1,127 @@
+.picker {
+  position: relative;
+}
+
+.picker__btn {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.picker__btn:hover,
+.picker__btn.is-open {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.picker__btn.is-open {
+  color: var(--accent);
+}
+
+.picker__pop {
+  position: absolute;
+  bottom: calc(100% + 14px);
+  left: 0;
+  z-index: 30;
+  padding: 8px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: rgba(18, 20, 26, 0.96);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 20px 44px -12px rgba(0, 0, 0, 0.75);
+  color: var(--text);
+  animation: picker-in 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes picker-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.picker__pop--shapes {
+  display: grid;
+  grid-template-columns: repeat(3, 44px);
+  gap: 4px;
+}
+
+.picker__pop--icons {
+  width: min(340px, calc(100vw - 24px));
+}
+
+.picker__cell {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.picker__cell--shape {
+  width: 44px;
+  height: 44px;
+}
+
+.picker__cell:hover {
+  background: rgba(155, 211, 165, 0.14);
+  border-color: rgba(155, 211, 165, 0.35);
+  color: var(--accent);
+}
+
+.picker__search {
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+}
+
+.picker__search::placeholder {
+  color: var(--muted);
+}
+
+.picker__search:focus {
+  border-color: var(--accent);
+}
+
+.picker__scroll {
+  max-height: 280px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+.picker__group {
+  margin: 8px 2px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.picker__icons {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+}
+
+.picker__empty {
+  padding: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}

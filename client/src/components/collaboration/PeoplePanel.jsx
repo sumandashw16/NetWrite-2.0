@@ -9,7 +9,7 @@ const ROLE_RANK = { host: 0, cohost: 1, joiner: 2 };
 const ROLE_LABEL = { host: 'Host', cohost: 'Co-host', joiner: 'Joiner' };
 const AVATAR_COLORS = ['#f87171', '#fb923c', '#fbbf24', '#a3e635', '#34d399', '#22d3ee', '#60a5fa', '#a78bfa', '#f472b6'];
 
-const colorFor = (name = '') => {
+export const colorFor = (name = '') => {
   let h = 0;
   for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
   return AVATAR_COLORS[h % AVATAR_COLORS.length];
@@ -67,6 +67,7 @@ export function AvatarStack({ members, max = 4, waiting = 0, onClick }) {
     </button>
   );
 }
+
 
 function IconBtn({ title, onClick, tone, active, children }) {
   return (
