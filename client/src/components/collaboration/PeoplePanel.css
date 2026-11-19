@@ -1,0 +1,296 @@
+/* ---------- avatar ---------- */
+.avatar {
+  position: relative;
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--avatar, #60a5fa);
+  color: rgba(0, 0, 0, 0.72);
+  font-weight: 700;
+  line-height: 1;
+  user-select: none;
+}
+
+.avatar__dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #4b5160;
+  border: 2px solid #1c1f27;
+}
+
+.avatar__dot.is-on {
+  background: #34d399;
+}
+
+/* ---------- avatar stack (top bar button) ---------- */
+.stack {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 12px 4px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.stack:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--border-strong);
+}
+
+.stack__avatars {
+  display: inline-flex;
+}
+
+.stack__avatars .avatar,
+.stack__more {
+  margin-left: -8px;
+  box-shadow: 0 0 0 2px #15171d;
+}
+
+.stack__avatars > :first-child {
+  margin-left: 0;
+}
+
+.stack__more {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #2a2e39;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.stack__count {
+  color: var(--muted);
+}
+
+.stack__waiting {
+  position: absolute;
+  top: -6px;
+  right: -4px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--warn);
+  color: #1c1400;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+/* ---------- role badges ---------- */
+.role {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.role--cohost {
+  background: rgba(155, 211, 165, 0.16);
+  color: var(--accent);
+}
+
+.role--joiner {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--muted);
+}
+
+/* StarBorder brings its own padding; this needs higher specificity to shrink it into a badge */
+.star-border.role--host {
+  padding: 2px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: #fbbf24;
+}
+
+/* ---------- panel ---------- */
+.people {
+  position: absolute;
+  top: 64px;
+  right: 12px;
+  z-index: 25;
+  width: 380px;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 84px);
+  overflow-y: auto;
+  padding: 16px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: rgba(18, 20, 26, 0.86);
+  -webkit-backdrop-filter: blur(22px) saturate(1.5);
+  backdrop-filter: blur(22px) saturate(1.5);
+  box-shadow: 0 30px 60px -20px rgba(0, 0, 0, 0.8);
+  color: var(--text);
+  animation: people-in 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes people-in {
+  from { opacity: 0; transform: translateY(-8px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+.people__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.people__head h3 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+}
+
+.people__head p {
+  margin: 3px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.people__close {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.people__close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
+.people__section + .people__section {
+  margin-top: 18px;
+}
+
+.people__section h4 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--muted);
+}
+
+.people__badge {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--warn);
+  color: #1c1400;
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
+/* ---------- a row inside AnimatedList ---------- */
+.person {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.person__text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.person__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14.5px;
+  font-weight: 600;
+}
+
+.person__name em {
+  font-style: normal;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.person__hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.person__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.perm {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  opacity: 0.7;
+}
+
+.icon-btn {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
+}
+
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text);
+}
+
+.icon-btn.is-active {
+  background: rgba(155, 211, 165, 0.16);
+  color: var(--accent);
+}
+
+.icon-btn--ok:hover {
+  background: rgba(52, 211, 153, 0.18);
+  color: #34d399;
+}
+
+.icon-btn--danger:hover {
+  background: rgba(248, 113, 113, 0.18);
+  color: var(--danger);
+}
