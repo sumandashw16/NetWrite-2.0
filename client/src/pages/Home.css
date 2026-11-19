@@ -99,6 +99,11 @@
   background: linear-gradient(transparent, var(--border-strong), transparent);
 }
 
+.col {
+  display: flex;
+  flex-direction: column;
+}
+
 .col__head {
   display: flex;
   align-items: center;
@@ -127,6 +132,15 @@
   margin: 6px 0 18px;
   color: var(--muted);
   font-size: 14px;
+}
+
+/* Reserve the same height for the toggle row in both columns,
+   so the .grid cards always start at the same horizontal line. */
+.col__toggle-row {
+  height: 32px;          /* matches the PrivateToggle line height */
+  display: flex;
+  align-items: center;
+  margin-bottom: 6px;
 }
 
 .grid {

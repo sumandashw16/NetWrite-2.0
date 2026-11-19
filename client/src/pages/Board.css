@@ -203,7 +203,7 @@
   align-items: center;
   gap: 4px;
   max-width: calc(100vw - 24px);
-  overflow-x: auto;
+  overflow: visible;
   padding: 6px;
   border-radius: 16px;
   border: 1px solid var(--border);

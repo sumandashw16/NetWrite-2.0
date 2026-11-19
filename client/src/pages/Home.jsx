@@ -260,7 +260,9 @@ export default function Home() {
         ) : (
           <div className="split">
             <Column title="Managed boards" subtitle="Boards you host or co-host" count={managed.length}>
-              <PrivateToggle checked={isPrivate} onChange={setIsPrivate} />
+              <div className="col__toggle-row">
+                <PrivateToggle checked={isPrivate} onChange={setIsPrivate} />
+              </div>
               <div className="grid">
                 <NewBoardCard onCreate={createNewBoard} busy={busy} />
                 {managed.map((b, i) => (
@@ -273,6 +275,7 @@ export default function Home() {
             <div className="split__divider" aria-hidden="true" />
 
             <Column title="Shared with me" subtitle="Boards you were invited to" count={shared.length}>
+              <div className="col__toggle-row" />
               <div className="grid">
                 {shared.map((b, i) => (
                   <BoardCard key={b.roomId} board={b} index={i} onOpen={open} />
